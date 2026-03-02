@@ -1262,12 +1262,6 @@ export async function generateAIComments(indicators: {
   }
 
   async function resolveFallbackComment(symbol: string, data: IndicatorData): Promise<string> {
-    const latestCached = await indicatorCommentCache.getLatestComment(symbol);
-    if (latestCached) {
-      console.log(`[generateAIComments] Using latest cached fallback for ${symbol}`);
-      return latestCached;
-    }
-
     const ruleBased = buildRuleBasedComment(symbol, data);
     console.log(`[generateAIComments] Using rule-based fallback for ${symbol}`);
     return ruleBased;
@@ -1353,8 +1347,8 @@ export async function generateAIComments(indicators: {
     } catch (error) {
       console.error('[generateAIComments] Batch generation error:', error);
 
-      // Fallback: Try to get latest cached comments for each symbol
-      console.log('[generateAIComments] Attempting fallback to latest cached comments...');
+      // Fallback: Generate rule-based comments from current indicator values
+      console.log('[generateAIComments] Attempting rule-based fallback comments...');
       for (const { symbol, data } of cacheMisses) {
         try {
           comments[symbol] = await resolveFallbackComment(symbol, data);

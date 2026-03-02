@@ -56,6 +56,8 @@ const ADVANCED_EXPLANATION_FALLBACK_PREFIX = 'gemini:advanced:fallback:';
 const ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY = 'gemini:advanced:fallback:index';
 const ADVANCED_EXPLANATION_TTL_SECONDS = 6 * 60 * 60; // 6 hours
 const MAX_ADVANCED_EXPLANATION_ENTRIES = 30;
+const MARKET_PREDICTION_PROMPT_VERSION = 'market-prompt-v3';
+const ADVANCED_EXPLANATION_PROMPT_VERSION = 'advanced-prompt-v2';
 const SIMILARITY_KEYS = [
   'us10y',
   'us2y',
@@ -593,6 +595,7 @@ class GeminiCacheRedis {
       });
 
     const raw = JSON.stringify({
+      promptVersion: ADVANCED_EXPLANATION_PROMPT_VERSION,
       model: modelName,
       timestamp: data.timestamp,
       indicators: normalizedIndicators,
@@ -603,6 +606,7 @@ class GeminiCacheRedis {
 
   private hashData(data: DashboardData, modelName: string): string {
     const rounded = {
+      promptVersion: MARKET_PREDICTION_PROMPT_VERSION,
       model: modelName,
       us10y: data.indicators.us10yYield.value.toFixed(2),
       us2y: data.indicators.us2yYield.value.toFixed(2),

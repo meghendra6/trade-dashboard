@@ -96,6 +96,11 @@ function buildRuleBasedPrediction(dashboardData: DashboardData): MarketPredictio
   }
 
   return {
+    regime: sentiment === 'bullish' ? '위험선호' : sentiment === 'bearish' ? '위험회피' : '박스권',
+    dominantDriver:
+      riskSignals.length >= bullishSignals.length
+        ? riskSignals[0] || '변동성 요인'
+        : bullishSignals[0] || '위험선호 요인',
     sentiment,
     reasoning:
       `AI 응답 생성이 지연되어 규칙 기반 분석으로 대체했습니다. ` +
@@ -229,25 +234,25 @@ export async function POST(request: Request) {
     // Check if it's a quota/rate limit error
     const isQuota = isQuotaError(error);
 
-    const fallbackPrediction = await geminiCache.getBestMatchingPrediction(
-      dashboardData,
-      modelName
-    );
-    if (fallbackPrediction) {
-      console.log(`[API] Using similarity-based fallback prediction (model: ${modelName})`);
-      return NextResponse.json({
-        ...fallbackPrediction,
-        isFallback: true,
-        fallbackMessage: isQuota
-          ? 'API 사용 한도가 초과되었습니다. 금일 분석 내역에서 가장 유사한 시장 상황의 분석을 표시합니다.'
-          : 'AI 분석 생성이 일시적으로 실패해 가장 유사한 과거 분석을 표시합니다.',
-      });
+    if (isQuota) {
+      const fallbackPrediction = await geminiCache.getBestMatchingPrediction(
+        dashboardData,
+        modelName
+      );
+      if (fallbackPrediction) {
+        console.log(`[API] Using similarity-based fallback prediction (model: ${modelName})`);
+        return NextResponse.json({
+          ...fallbackPrediction,
+          isFallback: true,
+          fallbackMessage: 'API 사용 한도가 초과되었습니다. 금일 분석 내역에서 가장 유사한 시장 상황의 분석을 표시합니다.',
+        });
+      }
     }
 
     const ruleBasedPrediction = buildRuleBasedPrediction(dashboardData);
     ruleBasedPrediction.fallbackMessage = isQuota
       ? 'API 사용 한도가 초과되어 규칙 기반 대체 분석을 표시합니다.'
-      : 'AI 분석 생성에 실패해 규칙 기반 대체 분석을 표시합니다.';
+      : 'AI 응답 형식이 일시적으로 불안정하여 현재 지표 기반 규칙 분석으로 대체합니다.';
     console.log(`[API] Returning rule-based fallback prediction (errorId: ${errorId})`);
     return NextResponse.json(ruleBasedPrediction);
   }
