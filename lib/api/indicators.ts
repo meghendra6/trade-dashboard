@@ -104,7 +104,7 @@ async function fetchFREDData(seriesId: string, limit: number = 40): Promise<{ cu
   url.searchParams.append('sort_order', 'desc');
   url.searchParams.append('limit', limit.toString());
 
-  const response = await fetch(url.toString(), { next: { revalidate: 300 } });
+  const response = await fetch(url.toString(), { next: { revalidate: 600 } });
 
   if (!response.ok) {
     throw new Error(`FRED API error: ${response.statusText}`);
@@ -133,7 +133,13 @@ async function fetchFREDData(seriesId: string, limit: number = 40): Promise<{ cu
 async function fetchYahooFinanceData(symbol: string): Promise<{ current: number; previous: number; history: HistoricalDataPoint[] }> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=3mo&interval=1d`;
 
-  const response = await fetch(url, { next: { revalidate: 300 } });
+  const response = await fetch(url, {
+    next: { revalidate: 600 },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (trade-dashboard)',
+      Accept: 'application/json',
+    },
+  });
 
   if (!response.ok) {
     throw new Error(`Yahoo Finance API error: ${response.statusText}`);
@@ -199,6 +205,76 @@ export async function getUS10YYield(): Promise<IndicatorData> {
     };
   } catch (error) {
     console.error('Error fetching US 10Y Yield:', error);
+    throw error;
+  }
+}
+
+export async function getUS2YYield(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchFREDData('DGS2');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'US 2Y Yield',
+      symbol: 'US2Y',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: '%',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching US 2Y Yield:', error);
+    throw error;
+  }
+}
+
+export async function getYieldCurveSpread(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchFREDData('T10Y2Y');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: '10Y-2Y Yield Curve Spread',
+      symbol: 'T10Y2Y',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'pp',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching 10Y-2Y Yield Curve Spread:', error);
     throw error;
   }
 }
@@ -310,6 +386,108 @@ export async function getM2MoneySupply(): Promise<IndicatorData> {
   }
 }
 
+export async function getSP500(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^GSPC');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'S&P 500 Index',
+      symbol: 'SPX',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching S&P 500:', error);
+    throw error;
+  }
+}
+
+export async function getNasdaq(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^IXIC');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'Nasdaq Composite',
+      symbol: 'IXIC',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching Nasdaq Composite:', error);
+    throw error;
+  }
+}
+
+export async function getRussell2000(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^RUT');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'Russell 2000 Index',
+      symbol: 'RUT',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching Russell 2000:', error);
+    throw error;
+  }
+}
+
 export async function getCrudeOil(): Promise<IndicatorData> {
   try {
     const { current, history } = await fetchYahooFinanceData('CL=F');
@@ -341,6 +519,357 @@ export async function getCrudeOil(): Promise<IndicatorData> {
     };
   } catch (error) {
     console.error('Error fetching Crude Oil:', error);
+    throw error;
+  }
+}
+
+export async function getGold(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('GC=F');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'Gold (COMEX Futures)',
+      symbol: 'GOLD',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: '$/oz',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching Gold:', error);
+    throw error;
+  }
+}
+
+export async function getMOVEIndex(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^MOVE');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'MOVE Index (Rate Volatility)',
+      symbol: 'MOVE',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching MOVE Index:', error);
+    throw error;
+  }
+}
+
+export async function getUSDKRW(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('KRW=X');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'USD/KRW Exchange Rate',
+      symbol: 'USDKRW',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'KRW/USD',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching USD/KRW:', error);
+    throw error;
+  }
+}
+
+export async function getKospi(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^KS11');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'KOSPI Composite Index',
+      symbol: 'KOSPI',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching KOSPI:', error);
+    throw error;
+  }
+}
+
+export async function getEWY(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('EWY');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'iShares MSCI Korea ETF',
+      symbol: 'EWY',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: '$',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching EWY:', error);
+    throw error;
+  }
+}
+
+export async function getKosdaq(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('^KQ11');
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'KOSDAQ Composite Index',
+      symbol: 'KOSDAQ',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching KOSDAQ:', error);
+    throw error;
+  }
+}
+
+export async function getKorea3YBondProxy(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('438560.KS'); // SOL KTB 3Y ETF
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'KR 3Y Treasury Proxy (KTB ETF)',
+      symbol: 'KR3Y',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'KRW',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching KR 3Y Treasury proxy:', error);
+    throw error;
+  }
+}
+
+export async function getKorea10YBondProxy(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('438570.KS'); // SOL KTB 10Y ETF
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'KR 10Y Treasury Proxy (KTB ETF)',
+      symbol: 'KR10Y',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'KRW',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching KR 10Y Treasury proxy:', error);
+    throw error;
+  }
+}
+
+export async function getKoreaSemiconductorExportsProxy(): Promise<IndicatorData> {
+  try {
+    const { current, history } = await fetchYahooFinanceData('091160.KS'); // KODEX Semiconductor ETF
+
+    // 1-day change (entry-based: last trading day)
+    const { change, changePercent } = calculatePeriodChange(current, history, 1);
+
+    // 7-day change (calendar-based: 7 calendar days ago)
+    const { change: change7d, changePercent: changePercent7d } =
+      calculateCalendarDayChange(current, history, 7);
+
+    // 30-day change (calendar-based: 30 calendar days ago)
+    const { change: change30d, changePercent: changePercent30d } =
+      calculateCalendarDayChange(current, history, 30);
+
+    return {
+      name: 'Korea Semiconductor Exports Proxy (KODEX)',
+      symbol: 'KRSEMI',
+      value: current,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'KRW',
+      history,
+    };
+  } catch (error) {
+    console.error('Error fetching Korea semiconductor proxy:', error);
+    throw error;
+  }
+}
+
+export async function getKoreaTradeBalance(): Promise<IndicatorData> {
+  try {
+    // OECD trade balance for Korea via FRED (monthly)
+    const { current, history } = await fetchFREDData('KORXTNTVA01NCMLM', 40);
+
+    // Convert KRW to trillion KRW for readability
+    const currentInTrillion = current / 1_000_000_000_000;
+    const historyInTrillion = history.map((point) => ({
+      date: point.date,
+      value: point.value / 1_000_000_000_000,
+    }));
+
+    // Monthly data: use entry-based changes for 1M/2M/3M
+    const { change, changePercent } = calculatePeriodChange(currentInTrillion, historyInTrillion, 1);
+    const { change: change7d, changePercent: changePercent7d } =
+      calculatePeriodChange(currentInTrillion, historyInTrillion, 2);
+    const { change: change30d, changePercent: changePercent30d } =
+      calculatePeriodChange(currentInTrillion, historyInTrillion, 3);
+
+    return {
+      name: 'Korea Trade Balance (Commodities)',
+      symbol: 'KRTB',
+      value: currentInTrillion,
+      change: change ?? 0,
+      changePercent: changePercent ?? 0,
+      change7d,
+      changePercent7d,
+      change30d,
+      changePercent30d,
+      lastUpdated: new Date().toISOString(),
+      unit: 'T KRW',
+      history: historyInTrillion.slice(-24),
+    };
+  } catch (error) {
+    console.error('Error fetching Korea trade balance:', error);
     throw error;
   }
 }
@@ -413,7 +942,7 @@ async function fetchCoinGeckoPrice(): Promise<{
   const priceUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_last_updated_at=true';
 
   const priceResponse = await fetch(priceUrl, {
-    next: { revalidate: 300 }, // Cache for 5 minutes
+    next: { revalidate: 600 }, // Cache for 5 minutes
   });
 
   if (!priceResponse.ok) {
@@ -657,35 +1186,65 @@ export async function getNFP(): Promise<IndicatorData> {
  */
 export async function generateAIComments(indicators: {
   us10yYield: IndicatorData;
+  us2yYield: IndicatorData;
+  yieldCurveSpread: IndicatorData;
   dxy: IndicatorData;
   highYieldSpread: IndicatorData;
   m2MoneySupply: IndicatorData;
   cpi: IndicatorData;
   payems: IndicatorData;
+  sp500: IndicatorData;
+  nasdaq: IndicatorData;
+  russell2000: IndicatorData;
   crudeOil: IndicatorData;
+  gold: IndicatorData;
+  moveIndex: IndicatorData;
   copperGoldRatio: IndicatorData;
   pmi: IndicatorData;
   putCallRatio: IndicatorData;
   bitcoin: IndicatorData;
+  usdKrw: IndicatorData;
+  kospi: IndicatorData;
+  ewy: IndicatorData;
+  kosdaq: IndicatorData;
+  kr3yBond: IndicatorData;
+  kr10yBond: IndicatorData;
+  koreaSemiconductorExportsProxy: IndicatorData;
+  koreaTradeBalance: IndicatorData;
 }): Promise<Record<string, string | undefined>> {
   const indicatorMap: Array<{ symbol: string; data: IndicatorData }> = [
     { symbol: 'US10Y', data: indicators.us10yYield },
+    { symbol: 'US2Y', data: indicators.us2yYield },
+    { symbol: 'T10Y2Y', data: indicators.yieldCurveSpread },
     { symbol: 'DXY', data: indicators.dxy },
     { symbol: 'HYS', data: indicators.highYieldSpread },
     { symbol: 'M2', data: indicators.m2MoneySupply },
     { symbol: 'CPI', data: indicators.cpi },
     { symbol: 'PAYEMS', data: indicators.payems },
+    { symbol: 'SPX', data: indicators.sp500 },
+    { symbol: 'IXIC', data: indicators.nasdaq },
+    { symbol: 'RUT', data: indicators.russell2000 },
     { symbol: 'OIL', data: indicators.crudeOil },
+    { symbol: 'GOLD', data: indicators.gold },
+    { symbol: 'MOVE', data: indicators.moveIndex },
     { symbol: 'Cu/Au', data: indicators.copperGoldRatio },
     { symbol: 'MFG', data: indicators.pmi },
     { symbol: 'VIX', data: indicators.putCallRatio },
     { symbol: 'BTC', data: indicators.bitcoin },
+    { symbol: 'USDKRW', data: indicators.usdKrw },
+    { symbol: 'KOSPI', data: indicators.kospi },
+    { symbol: 'EWY', data: indicators.ewy },
+    { symbol: 'KOSDAQ', data: indicators.kosdaq },
+    { symbol: 'KR3Y', data: indicators.kr3yBond },
+    { symbol: 'KR10Y', data: indicators.kr10yBond },
+    { symbol: 'KRSEMI', data: indicators.koreaSemiconductorExportsProxy },
+    { symbol: 'KRTB', data: indicators.koreaTradeBalance },
   ];
 
   // Result object to collect all comments
   const comments: Record<string, string | undefined> = {};
 
-  console.log('[generateAIComments] Starting batch AI comment generation for 11 indicators');
+  console.log(`[generateAIComments] Starting batch AI comment generation for ${indicatorMap.length} indicators`);
   const startTime = Date.now();
 
   // Step 1: Check cache for all indicators (parallel - fast)
@@ -764,45 +1323,90 @@ export async function getAllIndicators() {
   // Phase 1: Fetch all indicator data in parallel (no AI comments)
   const [
     us10yYield,
+    us2yYield,
+    yieldCurveSpread, // NEW: 10Y-2Y spread
     dxy,
     highYieldSpread,
     m2MoneySupply,
     cpi,             // NEW: Consumer Price Index
     payems,          // NEW: Total Nonfarm Employment (PAYEMS)
+    sp500,           // NEW: S&P 500 Index
+    nasdaq,          // NEW: Nasdaq Composite
+    russell2000,     // NEW: Russell 2000 Index
     crudeOil,
+    gold,            // NEW: Gold Futures
+    moveIndex,       // NEW: MOVE Index
     copperGoldRatio,
     pmi,
     putCallRatio,
     bitcoin,
+    usdKrw,          // NEW: USD/KRW exchange rate
+    kospi,           // NEW: KOSPI Index
+    ewy,             // NEW: iShares MSCI Korea ETF
+    kosdaq,          // NEW: KOSDAQ Index
+    kr3yBond,        // NEW: KR 3Y Treasury proxy
+    kr10yBond,       // NEW: KR 10Y Treasury proxy
+    koreaSemiconductorExportsProxy, // NEW: Korea semiconductor exports proxy
+    koreaTradeBalance, // NEW: Korea trade balance (monthly)
   ] = await Promise.all([
     getUS10YYield(),
+    getUS2YYield(),
+    getYieldCurveSpread(),        // NEW
     getDXY(),
     getHighYieldSpread(),
     getM2MoneySupply(),
     getCPI(),                    // NEW
     getNFP(),                    // NEW
+    getSP500(),                  // NEW
+    getNasdaq(),                 // NEW
+    getRussell2000(),            // NEW
     getCrudeOil(),
+    getGold(),                   // NEW
+    getMOVEIndex(),              // NEW
     getCopperGoldRatio(),
     getPMI(),
     getPutCallRatio(),
     getBitcoin(),
+    getUSDKRW(),                 // NEW
+    getKospi(),                  // NEW
+    getEWY(),                    // NEW
+    getKosdaq(),                 // NEW
+    getKorea3YBondProxy(),       // NEW
+    getKorea10YBondProxy(),      // NEW
+    getKoreaSemiconductorExportsProxy(), // NEW
+    getKoreaTradeBalance(),      // NEW
   ]);
 
   const indicators = {
     us10yYield,
+    us2yYield,
+    yieldCurveSpread, // NEW
     dxy,
     highYieldSpread,
     m2MoneySupply,
     cpi,             // NEW
     payems,          // NEW
+    sp500,           // NEW
+    nasdaq,          // NEW
+    russell2000,     // NEW
     crudeOil,
+    gold,            // NEW
+    moveIndex,       // NEW
     copperGoldRatio,
     pmi,
     putCallRatio,
     bitcoin,
+    usdKrw,          // NEW
+    kospi,           // NEW
+    ewy,             // NEW
+    kosdaq,          // NEW
+    kr3yBond,        // NEW
+    kr10yBond,       // NEW
+    koreaSemiconductorExportsProxy, // NEW
+    koreaTradeBalance, // NEW
   };
 
-  console.log('[getAllIndicators] Completed with 11 indicators');
+  console.log(`[getAllIndicators] Completed with ${Object.keys(indicators).length} indicators`);
 
   return indicators;
 }

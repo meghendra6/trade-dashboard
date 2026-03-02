@@ -21,12 +21,18 @@ interface CachedComment {
  *
  * Strategy: Very aggressive rounding to maximize cache hit rate (50-70% target)
  * - BTC: $5,000 units ($96,500 → $95,000)
- * - US10Y/HYS: 0.5% units (4.52% → 4.5%)
+ * - US10Y/US2Y/T10Y2Y/HYS/MOVE: 0.5 units
  * - DXY/VIX: 5.0 units (103.47 → 105)
  * - OIL: $5 units ($56.6 → $55)
  * - Cu/Au: 0.5 units (13.32 → 13.5)
  * - M2: $500B units
  * - MFG: 0.5 units
+ * - SPX/IXIC/RUT/KOSPI: 25 units
+ * - KOSDAQ: 10 units
+ * - KR3Y/KR10Y/KRSEMI: 1 unit
+ * - USDKRW: 10 KRW
+ * - EWY/GOLD: $1 units
+ * - KRTB: 0.1 trillion KRW
  *
  * Cache key: Only uses indicator value (no date, no change percentages)
  * - AI comments describe general trends, not exact values
@@ -47,19 +53,40 @@ class IndicatorCommentCache {
       case 'BTC':
         return Math.round(value / 5000) * 5000; // $5,000 units ($96,500 → $95,000)
       case 'US10Y':
+      case 'US2Y':
+      case 'T10Y2Y':
       case 'HYS':
+      case 'MOVE':
         return Math.round(value * 2) / 2; // 0.5% units (4.52% → 4.5%)
       case 'DXY':
       case 'VIX':
         return Math.round(value / 5) * 5; // 5.0 units (103.47 → 105)
+      case 'SPX':
+      case 'IXIC':
+      case 'RUT':
+      case 'KOSPI':
+        return Math.round(value / 25) * 25;
+      case 'KOSDAQ':
+        return Math.round(value / 10) * 10;
       case 'M2':
         return Math.round(value / 500) * 500; // $500B units
       case 'OIL':
         return Math.round(value / 5) * 5; // $5 units ($56.6 → $55)
+      case 'USDKRW':
+        return Math.round(value / 10) * 10;
+      case 'KR3Y':
+      case 'KR10Y':
+      case 'KRSEMI':
+        return Math.round(value);
+      case 'KRTB':
+        return Math.round(value * 10) / 10;
       case 'Cu/Au':
         return Math.round(value * 2) / 2; // 0.5 units (13.32 → 13.5)
       case 'MFG':
         return Math.round(value * 2) / 2; // 0.5 units
+      case 'EWY':
+      case 'GOLD':
+        return Math.round(value);
       case 'CPI':
         return Math.round(value * 10) / 10; // 0.1 units (308.417 → 308.4)
       case 'PAYEMS':
