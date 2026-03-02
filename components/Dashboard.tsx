@@ -33,7 +33,7 @@ export default function Dashboard() {
       const comments: IndicatorComments = data?.comments ?? {};
 
       // Update aiComments state separately (does not affect dashboardData reference)
-      setAiComments(comments);
+      setAiComments((prev) => ({ ...prev, ...comments }));
     } catch (err) {
       console.error('Error fetching AI comments:', err);
     } finally {

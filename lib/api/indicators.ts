@@ -1223,6 +1223,56 @@ export async function generateAIComments(indicators: {
   koreaSemiconductorExportsProxy: IndicatorData;
   koreaTradeBalance: IndicatorData;
 }): Promise<Record<string, string | undefined>> {
+  function formatSignedPercent(value: number | undefined): string {
+    if (value === undefined || Number.isNaN(value)) {
+      return 'n/a';
+    }
+    return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+  }
+
+  function buildRuleBasedComment(symbol: string, data: IndicatorData): string {
+    const shortTrend = data.changePercent >= 0 ? '상승' : '하락';
+    const short = formatSignedPercent(data.changePercent);
+    const mid = formatSignedPercent(data.changePercent7d);
+    const long = formatSignedPercent(data.changePercent30d);
+
+    const regime =
+      data.changePercent >= 0 &&
+      (data.changePercent7d ?? data.changePercent) >= 0 &&
+      (data.changePercent30d ?? data.changePercent7d ?? data.changePercent) >= 0
+        ? '상승 추세가 이어지는 구간'
+        : data.changePercent <= 0 &&
+          (data.changePercent7d ?? data.changePercent) <= 0 &&
+          (data.changePercent30d ?? data.changePercent7d ?? data.changePercent) <= 0
+        ? '하락 추세가 이어지는 구간'
+        : '단기와 중기 방향이 엇갈리는 혼조 구간';
+
+    let impactHint = '포지션 규모를 과도하게 키우기보다 주요 이벤트 확인 후 대응하는 편이 안전합니다.';
+    if (['US10Y', 'US2Y', 'T10Y2Y', 'MOVE', 'HYS'].includes(symbol)) {
+      impactHint = '금리·신용 여건 변화가 주식 밸류에이션과 위험자산 선호에 직접적인 영향을 줄 수 있습니다.';
+    } else if (['SPX', 'IXIC', 'RUT', 'KOSPI', 'KOSDAQ', 'EWY'].includes(symbol)) {
+      impactHint = '지수 방향성 변화가 섹터 회전과 위험선호 레짐 전환 신호로 이어질 수 있습니다.';
+    } else if (['OIL', 'GOLD', 'Cu/Au', 'BTC'].includes(symbol)) {
+      impactHint = '원자재·대체자산 흐름은 인플레이션 기대와 리스크 회피 심리 변화를 함께 반영합니다.';
+    } else if (['USDKRW', 'KR3Y', 'KR10Y', 'KRSEMI', 'KRTB'].includes(symbol)) {
+      impactHint = '한국 관련 자산에서는 환율과 수출 모멘텀, 금리 조건의 동시 점검이 필요합니다.';
+    }
+
+    return `${data.name}(${symbol})는 단기 기준 ${short}(${shortTrend})를 보였고, 중기 ${mid} / 장기 ${long} 흐름을 감안하면 ${regime}으로 해석됩니다. ${impactHint}`;
+  }
+
+  async function resolveFallbackComment(symbol: string, data: IndicatorData): Promise<string> {
+    const latestCached = await indicatorCommentCache.getLatestComment(symbol);
+    if (latestCached) {
+      console.log(`[generateAIComments] Using latest cached fallback for ${symbol}`);
+      return latestCached;
+    }
+
+    const ruleBased = buildRuleBasedComment(symbol, data);
+    console.log(`[generateAIComments] Using rule-based fallback for ${symbol}`);
+    return ruleBased;
+  }
+
   const indicatorMap: Array<{ symbol: string; data: IndicatorData }> = [
     { symbol: 'US10Y', data: indicators.us10yYield },
     { symbol: 'US2Y', data: indicators.us2yYield },
@@ -1296,7 +1346,8 @@ export async function generateAIComments(indicators: {
           await indicatorCommentCache.setComment(symbol, data, comment);
           console.log(`[generateAIComments] Cached batch comment for ${symbol}`);
         } else {
-          console.warn(`[generateAIComments] No comment generated for ${symbol} (graceful degradation)`);
+          console.warn(`[generateAIComments] No comment generated for ${symbol}, applying fallback`);
+          comments[symbol] = await resolveFallbackComment(symbol, data);
         }
       }
     } catch (error) {
@@ -1304,20 +1355,23 @@ export async function generateAIComments(indicators: {
 
       // Fallback: Try to get latest cached comments for each symbol
       console.log('[generateAIComments] Attempting fallback to latest cached comments...');
-      for (const { symbol } of cacheMisses) {
+      for (const { symbol, data } of cacheMisses) {
         try {
-          const fallbackComment = await indicatorCommentCache.getLatestComment(symbol);
-          if (fallbackComment) {
-            comments[symbol] = fallbackComment;
-            console.log(`[generateAIComments] Using fallback comment for ${symbol}`);
-          } else {
-            console.warn(`[generateAIComments] No fallback available for ${symbol}`);
-          }
+          comments[symbol] = await resolveFallbackComment(symbol, data);
         } catch (fallbackError) {
           console.error(`[generateAIComments] Fallback error for ${symbol}:`, fallbackError);
         }
       }
     }
+  }
+
+  // Final safety net: ensure all symbols always have a comment.
+  for (const { symbol, data } of indicatorMap) {
+    if (comments[symbol]) {
+      continue;
+    }
+    comments[symbol] = buildRuleBasedComment(symbol, data);
+    console.warn(`[generateAIComments] Filled missing comment with final fallback for ${symbol}`);
   }
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(2);
