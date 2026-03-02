@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import {
   generateMarketPrediction,
+  MarketPrediction,
   getGeminiCliLoad,
   getGeminiCliLimits,
   GeminiQueueFullError,
@@ -63,6 +64,55 @@ async function readRequestBodyWithLimit(request: Request, maxBytes: number): Pro
   return new TextDecoder().decode(merged);
 }
 
+function buildRuleBasedPrediction(dashboardData: DashboardData): MarketPrediction {
+  const indicators = dashboardData.indicators;
+  const riskSignals: string[] = [];
+  const bullishSignals: string[] = [];
+
+  if (indicators.yieldCurveSpread.value < 0) riskSignals.push('장단기 금리 역전');
+  if (indicators.putCallRatio.value >= 24) riskSignals.push('변동성 지수(VIX) 고점 구간');
+  if (indicators.moveIndex.value >= 110) riskSignals.push('채권 변동성(MOVE) 확대');
+  if (indicators.highYieldSpread.value >= 4) riskSignals.push('하이일드 스프레드 확대');
+  if (indicators.usdKrw.changePercent > 1) riskSignals.push('원/달러 급등');
+  if (indicators.sp500.changePercent < 0) riskSignals.push('S&P500 단기 약세');
+  if (indicators.nasdaq.changePercent < 0) riskSignals.push('나스닥 단기 약세');
+
+  if (indicators.sp500.changePercent > 0) bullishSignals.push('S&P500 반등');
+  if (indicators.nasdaq.changePercent > 0) bullishSignals.push('나스닥 반등');
+  if (indicators.russell2000.changePercent > 0) bullishSignals.push('러셀2000 반등');
+  if (indicators.payems.changePercent > 0) bullishSignals.push('고용 지표 개선');
+  if (indicators.pmi.changePercent > 0) bullishSignals.push('제조업 심리 개선');
+  if (indicators.kospi.changePercent > 0 || indicators.kosdaq.changePercent > 0) {
+    bullishSignals.push('한국 주식시장 위험선호 회복');
+  }
+
+  const score = bullishSignals.length - riskSignals.length;
+  const sentiment: MarketPrediction['sentiment'] =
+    score >= 2 ? 'bullish' : score <= -2 ? 'bearish' : 'neutral';
+
+  const risks = riskSignals.slice(0, 4);
+  if (risks.length === 0) {
+    risks.push('핵심 이벤트 전후 변동성 확대 가능성');
+  }
+
+  return {
+    regime: sentiment === 'bullish' ? '위험선호' : sentiment === 'bearish' ? '위험회피' : '박스권',
+    dominantDriver:
+      riskSignals.length >= bullishSignals.length
+        ? riskSignals[0] || '변동성 요인'
+        : bullishSignals[0] || '위험선호 요인',
+    sentiment,
+    reasoning:
+      `AI 응답 생성이 지연되어 규칙 기반 분석으로 대체했습니다. ` +
+      `현재는 위험 신호 ${riskSignals.length}개, 개선 신호 ${bullishSignals.length}개가 관측되며 ` +
+      `${sentiment === 'bullish' ? '완만한 위험선호 회복' : sentiment === 'bearish' ? '방어적 대응 우위' : '방향성 혼조'} 국면으로 해석됩니다.`,
+    risks,
+    timestamp: new Date().toISOString(),
+    isFallback: true,
+    fallbackMessage: 'AI 분석이 일시적으로 불안정하여 규칙 기반 대체 분석을 표시합니다.',
+  };
+}
+
 export async function POST(request: Request) {
   const contentLength = Number.parseInt(request.headers.get('content-length') || '0', 10);
   if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
@@ -92,18 +142,6 @@ export async function POST(request: Request) {
           : '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
       },
       { status: isMisconfigured ? 503 : 429, headers: { 'Retry-After': String(rateLimitDecision.retryAfterSeconds) } }
-    );
-  }
-
-  const { queuedRequests } = getGeminiCliLoad();
-  const { maxQueueDepth } = getGeminiCliLimits();
-  if (queuedRequests >= maxQueueDepth) {
-    return NextResponse.json(
-      {
-        error: 'server_busy',
-        message: '현재 AI 분석 요청이 많습니다. 잠시 후 다시 시도해주세요.',
-      },
-      { status: 503, headers: { 'Retry-After': '10' } }
     );
   }
 
@@ -167,6 +205,14 @@ export async function POST(request: Request) {
       return NextResponse.json(cachedPrediction);
     }
 
+    const { queuedRequests } = getGeminiCliLoad();
+    const { maxQueueDepth } = getGeminiCliLimits();
+    if (queuedRequests >= maxQueueDepth) {
+      const busyFallback = buildRuleBasedPrediction(dashboardData);
+      busyFallback.fallbackMessage = '현재 AI 분석 요청이 많아 규칙 기반 대체 분석을 표시합니다.';
+      return NextResponse.json(busyFallback);
+    }
+
     // Cache miss - generate new prediction
     console.log(`[API] Cache miss - generating new Gemini prediction (model: ${modelName})`);
     const prediction = await generateMarketPrediction(dashboardData, modelName);
@@ -177,13 +223,9 @@ export async function POST(request: Request) {
     return NextResponse.json(prediction);
   } catch (error) {
     if (error instanceof GeminiQueueFullError) {
-      return NextResponse.json(
-        {
-          error: 'server_busy',
-          message: '현재 AI 분석 요청이 많습니다. 잠시 후 다시 시도해주세요.',
-        },
-        { status: 503, headers: { 'Retry-After': '10' } }
-      );
+      const busyFallback = buildRuleBasedPrediction(dashboardData);
+      busyFallback.fallbackMessage = '현재 AI 분석 요청이 많아 규칙 기반 대체 분석을 표시합니다.';
+      return NextResponse.json(busyFallback);
     }
 
     const errorId = randomUUID();
@@ -192,35 +234,26 @@ export async function POST(request: Request) {
     // Check if it's a quota/rate limit error
     const isQuota = isQuotaError(error);
 
-    // If quota error, try to use similarity-based fallback cache
     if (isQuota) {
       const fallbackPrediction = await geminiCache.getBestMatchingPrediction(
         dashboardData,
         modelName
       );
       if (fallbackPrediction) {
-        console.log(`[API] Using similarity-based fallback prediction due to quota error (model: ${modelName})`);
+        console.log(`[API] Using similarity-based fallback prediction (model: ${modelName})`);
         return NextResponse.json({
           ...fallbackPrediction,
           isFallback: true,
           fallbackMessage: 'API 사용 한도가 초과되었습니다. 금일 분석 내역에서 가장 유사한 시장 상황의 분석을 표시합니다.',
         });
       }
-      console.log(`[API] No fallback available for model ${modelName}, returning quota error`);
     }
 
-    const clientMessage = isQuota
-      ? 'API 사용 한도가 초과되었습니다. 잠시 후 다시 시도해주세요.'
-      : 'AI 분석 생성에 실패했습니다. 잠시 후 다시 시도해주세요.';
-
-    return NextResponse.json(
-      {
-        error: isQuota ? 'quota_exceeded' : 'prediction_failed',
-        message: clientMessage,
-        isQuotaError: isQuota,
-        errorId,
-      },
-      { status: isQuota ? 429 : 500 }
-    );
+    const ruleBasedPrediction = buildRuleBasedPrediction(dashboardData);
+    ruleBasedPrediction.fallbackMessage = isQuota
+      ? 'API 사용 한도가 초과되어 규칙 기반 대체 분석을 표시합니다.'
+      : 'AI 응답 형식이 일시적으로 불안정하여 현재 지표 기반 규칙 분석으로 대체합니다.';
+    console.log(`[API] Returning rule-based fallback prediction (errorId: ${errorId})`);
+    return NextResponse.json(ruleBasedPrediction);
   }
 }

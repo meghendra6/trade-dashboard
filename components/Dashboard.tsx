@@ -5,6 +5,7 @@ import { DashboardData, IndicatorComments } from '@/lib/types/indicators';
 import IndicatorCard from './IndicatorCard';
 import AIPrediction from './AIPrediction';
 import AdvancedAnalytics from './AdvancedAnalytics';
+import { INDICATOR_GROUPS } from '@/lib/constants/indicator-groups';
 
 export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -32,7 +33,7 @@ export default function Dashboard() {
       const comments: IndicatorComments = data?.comments ?? {};
 
       // Update aiComments state separately (does not affect dashboardData reference)
-      setAiComments(comments);
+      setAiComments((prev) => ({ ...prev, ...comments }));
     } catch (err) {
       console.error('Error fetching AI comments:', err);
     } finally {
@@ -144,6 +145,19 @@ export default function Dashboard() {
     return null;
   }
 
+  let animationIndex = 0;
+  const groupedSections = INDICATOR_GROUPS.map((group) => {
+    const cards = group.items.map((item) => ({
+      ...item,
+      animationIndex: animationIndex++,
+    }));
+
+    return {
+      ...group,
+      cards,
+    };
+  });
+
   return (
     <div className="w-full">
       <div className="mb-8">
@@ -167,46 +181,30 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
-        {/* Macro Indicators (8 cards) */}
-        <IndicatorCard indicator={data.indicators.us10yYield} aiComment={aiComments.US10Y} isLoadingComments={isLoadingComments} index={0} />
-        <IndicatorCard indicator={data.indicators.us2yYield} aiComment={aiComments.US2Y} isLoadingComments={isLoadingComments} index={1} />
-        <IndicatorCard indicator={data.indicators.yieldCurveSpread} aiComment={aiComments.T10Y2Y} isLoadingComments={isLoadingComments} index={2} />
-        <IndicatorCard indicator={data.indicators.dxy} aiComment={aiComments.DXY} isLoadingComments={isLoadingComments} index={3} />
-        <IndicatorCard indicator={data.indicators.highYieldSpread} aiComment={aiComments.HYS} isLoadingComments={isLoadingComments} index={4} />
-        <IndicatorCard indicator={data.indicators.m2MoneySupply} aiComment={aiComments.M2} isLoadingComments={isLoadingComments} index={5} />
-        <IndicatorCard indicator={data.indicators.cpi} aiComment={aiComments.CPI} isLoadingComments={isLoadingComments} index={6} />
-        <IndicatorCard indicator={data.indicators.payems} aiComment={aiComments.PAYEMS} isLoadingComments={isLoadingComments} index={7} />
-
-        {/* Equity Market Indicators (3 cards) */}
-        <IndicatorCard indicator={data.indicators.sp500} aiComment={aiComments.SPX} isLoadingComments={isLoadingComments} index={8} />
-        <IndicatorCard indicator={data.indicators.nasdaq} aiComment={aiComments.IXIC} isLoadingComments={isLoadingComments} index={9} />
-        <IndicatorCard indicator={data.indicators.russell2000} aiComment={aiComments.RUT} isLoadingComments={isLoadingComments} index={10} />
-
-        {/* Commodity & Asset Indicators (4 cards) */}
-        <IndicatorCard indicator={data.indicators.crudeOil} aiComment={aiComments.OIL} isLoadingComments={isLoadingComments} index={11} />
-        <IndicatorCard indicator={data.indicators.gold} aiComment={aiComments.GOLD} isLoadingComments={isLoadingComments} index={12} />
-        <IndicatorCard indicator={data.indicators.copperGoldRatio} aiComment={aiComments['Cu/Au']} isLoadingComments={isLoadingComments} index={13} />
-        <IndicatorCard indicator={data.indicators.bitcoin} aiComment={aiComments.BTC} isLoadingComments={isLoadingComments} index={14} />
-
-        {/* Risk-Sensitive Indicators (2 cards) */}
-        <IndicatorCard indicator={data.indicators.putCallRatio} aiComment={aiComments.VIX} isLoadingComments={isLoadingComments} index={15} />
-        <IndicatorCard indicator={data.indicators.moveIndex} aiComment={aiComments.MOVE} isLoadingComments={isLoadingComments} index={16} />
-
-        {/* Korea-Related Indicators (3 cards) */}
-        <IndicatorCard indicator={data.indicators.usdKrw} aiComment={aiComments.USDKRW} isLoadingComments={isLoadingComments} index={17} />
-        <IndicatorCard indicator={data.indicators.kospi} aiComment={aiComments.KOSPI} isLoadingComments={isLoadingComments} index={18} />
-        <IndicatorCard indicator={data.indicators.ewy} aiComment={aiComments.EWY} isLoadingComments={isLoadingComments} index={19} />
-
-        {/* Korea-Specialized Indicators (5 cards) */}
-        <IndicatorCard indicator={data.indicators.kosdaq} aiComment={aiComments.KOSDAQ} isLoadingComments={isLoadingComments} index={20} />
-        <IndicatorCard indicator={data.indicators.kr3yBond} aiComment={aiComments.KR3Y} isLoadingComments={isLoadingComments} index={21} />
-        <IndicatorCard indicator={data.indicators.kr10yBond} aiComment={aiComments.KR10Y} isLoadingComments={isLoadingComments} index={22} />
-        <IndicatorCard indicator={data.indicators.koreaSemiconductorExportsProxy} aiComment={aiComments.KRSEMI} isLoadingComments={isLoadingComments} index={23} />
-        <IndicatorCard indicator={data.indicators.koreaTradeBalance} aiComment={aiComments.KRTB} isLoadingComments={isLoadingComments} index={24} />
-
-        {/* Macro Sentiment (1 card) */}
-        <IndicatorCard indicator={data.indicators.pmi} aiComment={aiComments.MFG} isLoadingComments={isLoadingComments} index={25} />
+      <div className="space-y-8 mb-8">
+        {groupedSections.map((group) => (
+          <section key={group.id}>
+            <div className="mb-3 px-1">
+              <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+                {group.title}
+              </h2>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                {group.description}
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {group.cards.map(({ indicatorKey, commentKey, animationIndex: cardIndex }) => (
+                <IndicatorCard
+                  key={`${group.id}-${indicatorKey}`}
+                  indicator={data.indicators[indicatorKey]}
+                  aiComment={aiComments[commentKey]}
+                  isLoadingComments={isLoadingComments}
+                  index={cardIndex}
+                />
+              ))}
+            </div>
+          </section>
+        ))}
       </div>
 
       <AdvancedAnalytics dashboardData={data} />

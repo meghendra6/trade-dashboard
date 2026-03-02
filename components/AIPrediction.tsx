@@ -8,12 +8,20 @@ import {
   GeminiModelName,
   DEFAULT_GEMINI_MODEL
 } from '@/lib/constants/gemini-models';
+import { parseApiErrorMessage } from '@/lib/utils/api-error-message';
 
 const STORAGE_KEY = 'gemini-model-preference';
-const STORAGE_MIGRATION_KEY = 'gemini-model-preference-pro-default-migrated';
+const STORAGE_MIGRATION_KEY = 'gemini-model-preference-default-model-migrated';
 
 interface AIPredictionProps {
   dashboardData: DashboardData;
+}
+
+function statusFallbackMessage(status: number): string {
+  if (status === 429) return 'API 사용 한도가 초과되었습니다. 잠시 후 다시 시도해주세요.';
+  if (status === 503) return '현재 AI 분석 요청이 많습니다. 잠시 후 다시 시도해주세요.';
+  if (status >= 500) return 'AI 분석 생성에 실패했습니다. 잠시 후 다시 시도해주세요.';
+  return '요청 처리 중 오류가 발생했습니다.';
 }
 
 export default function AIPrediction({ dashboardData }: AIPredictionProps) {
@@ -28,22 +36,31 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
     }
 
     try {
-      const hasMigrated = localStorage.getItem(STORAGE_MIGRATION_KEY) === 'true';
       const savedModel = localStorage.getItem(STORAGE_KEY) as GeminiModelName | null;
+      const hasMigrated = localStorage.getItem(STORAGE_MIGRATION_KEY) === 'true';
+      const hasValidSavedModel = Boolean(savedModel && GEMINI_MODELS.some(m => m.value === savedModel));
 
-      // One-time migration:
-      // when default changed to Pro, reset old persisted preference once.
+      // One-time migration for users who still have the old default(Pro) or no valid saved model.
       if (!hasMigrated) {
         localStorage.setItem(STORAGE_MIGRATION_KEY, 'true');
-        localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
-        console.log(`[AIPrediction] Migrated model preference to default: ${DEFAULT_GEMINI_MODEL}`);
-        return DEFAULT_GEMINI_MODEL;
+
+        if (savedModel === 'gemini-3.1-pro-preview') {
+          localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
+          console.log(
+            `[AIPrediction] Migrated legacy default model from ${savedModel} to ${DEFAULT_GEMINI_MODEL}`
+          );
+          return DEFAULT_GEMINI_MODEL;
+        }
       }
 
-      if (savedModel && GEMINI_MODELS.some(m => m.value === savedModel)) {
+      if (hasValidSavedModel) {
         console.log(`[AIPrediction] Loaded model from localStorage: ${savedModel}`);
-        return savedModel;
+        return savedModel as GeminiModelName;
       }
+
+      localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
+      console.log(`[AIPrediction] Initialized model preference to default: ${DEFAULT_GEMINI_MODEL}`);
+      return DEFAULT_GEMINI_MODEL;
     } catch (error) {
       console.warn('localStorage not available:', error);
     }
@@ -74,14 +91,8 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-
-        // Check if it's a quota error
-        if (errorData.isQuotaError || response.status === 429) {
-          throw new Error(errorData.message || 'API 사용 한도가 초과되었습니다.');
-        }
-
-        throw new Error(errorData.message || 'Failed to fetch AI prediction');
+        const message = await parseApiErrorMessage(response, statusFallbackMessage);
+        throw new Error(message);
       }
 
       const data: MarketPrediction = await response.json();
@@ -248,6 +259,21 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
               </span>
             </div>
           </div>
+
+          {(prediction.regime || prediction.dominantDriver) && (
+            <div className="space-y-2">
+              {prediction.regime && (
+                <div className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border border-blue-200/70 dark:border-blue-800/60">
+                  시장 국면: {prediction.regime}
+                </div>
+              )}
+              {prediction.dominantDriver && (
+                <p className="text-sm text-zinc-600 dark:text-zinc-300 leading-relaxed">
+                  핵심 동인: {prediction.dominantDriver}
+                </p>
+              )}
+            </div>
+          )}
 
           <div>
             <h3 className="text-sm font-semibold text-zinc-700 dark:text-zinc-200 mb-2">
