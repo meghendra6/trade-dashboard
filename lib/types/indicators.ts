@@ -33,6 +33,16 @@ export interface IndicatorCommentsResponse {
   comments: IndicatorComments;
 }
 
+export interface AdvancedAnalyticsExplanation {
+  summary: string;
+  periodComparison: string;
+  volatilityTrend: string;
+  topSignals: string[];
+  generatedAt: string;
+  isFallback?: boolean;
+  fallbackMessage?: string;
+}
+
 export interface DashboardData {
   indicators: {
     // Core indicators

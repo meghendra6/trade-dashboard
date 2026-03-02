@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { DashboardData, IndicatorData } from '../types/indicators';
+import { DashboardData, IndicatorData, AdvancedAnalyticsExplanation } from '../types/indicators';
 import { GeminiModelName, DEFAULT_GEMINI_MODEL } from '../constants/gemini-models';
 import { createQuotaError } from '../types/errors';
 
@@ -247,22 +247,86 @@ function sanitizeCliMessage(raw: string): string {
     .map((line) => line.trim())
     .find((line) => line.length > 0 && !line.startsWith('at '));
 
-  if (!firstLine) {
+  if (!firstLine || firstLine === '[object Object]') {
     return 'gemini-cli 호출 중 오류가 발생했습니다.';
   }
 
   return firstLine.length > 280 ? `${firstLine.slice(0, 280)}...` : firstLine;
 }
 
+function extractReadableMessage(input: unknown): string | null {
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (!trimmed || trimmed === '[object Object]') {
+      return null;
+    }
+    return trimmed;
+  }
+
+  if (typeof input === 'number' || typeof input === 'boolean' || typeof input === 'bigint') {
+    return String(input);
+  }
+
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      const nested = extractReadableMessage(item);
+      if (nested) {
+        return nested;
+      }
+    }
+    return null;
+  }
+
+  if (input && typeof input === 'object') {
+    const record = input as Record<string, unknown>;
+    const candidateKeys = ['message', 'error', 'detail', 'details', 'reason', 'stderr', 'stdout', 'text'];
+    for (const key of candidateKeys) {
+      const nested = extractReadableMessage(record[key]);
+      if (nested) {
+        return nested;
+      }
+    }
+
+    try {
+      const serialized = JSON.stringify(input);
+      if (serialized && serialized !== '{}' && serialized !== '[object Object]') {
+        return serialized;
+      }
+    } catch {
+      // Ignore serialization failures
+    }
+  }
+
+  return null;
+}
+
+function normalizeUnknownErrorMessage(
+  input: unknown,
+  fallback = 'gemini-cli 호출에 실패했습니다.'
+): string {
+  const extracted = extractReadableMessage(input);
+  if (!extracted) {
+    return fallback;
+  }
+  return sanitizeCliMessage(extracted);
+}
+
 function parseGeminiCliResponse(stdout: string): string {
   const parsed = parseGeminiCliJson(stdout);
 
-  if (parsed?.error?.message) {
-    throw new Error(parsed.error.message);
+  if (parsed?.error) {
+    throw new Error(normalizeUnknownErrorMessage(parsed.error.message || parsed.error));
   }
 
   if (typeof parsed?.response === 'string' && parsed.response.trim()) {
     return parsed.response;
+  }
+
+  if (parsed?.response !== undefined) {
+    const parsedResponse = extractReadableMessage(parsed.response);
+    if (parsedResponse) {
+      return parsedResponse;
+    }
   }
 
   const fallback = stdout.trim();
@@ -274,7 +338,7 @@ function parseGeminiCliResponse(stdout: string): string {
 
 function buildGeminiCliError(error: unknown): Error {
   if (!(error instanceof Error)) {
-    return new Error(String(error));
+    return new Error(normalizeUnknownErrorMessage(error));
   }
 
   const cliError = error as ExecFileFailure;
@@ -283,10 +347,10 @@ function buildGeminiCliError(error: unknown): Error {
   const parsedStdout = parseGeminiCliJson(stdout);
   const parsedStderr = parseGeminiCliJson(stderr);
 
-  const cliMessage = parsedStdout?.error?.message ||
-    parsedStderr?.error?.message ||
-    parsedStdout?.response ||
-    parsedStderr?.response;
+  const cliMessage = extractReadableMessage(parsedStdout?.error?.message) ||
+    extractReadableMessage(parsedStderr?.error?.message) ||
+    extractReadableMessage(parsedStdout?.response) ||
+    extractReadableMessage(parsedStderr?.response);
 
   if (cliError.code === 'ENOENT') {
     return new Error('gemini-cli 실행 파일을 찾을 수 없습니다. GEMINI_CLI_PATH 또는 PATH를 확인해주세요.');
@@ -311,6 +375,13 @@ function buildGeminiCliError(error: unknown): Error {
 
   if (stdout.trim()) {
     return new Error(sanitizeCliMessage(stdout));
+  }
+
+  if (cliError.message?.trim()) {
+    const normalized = sanitizeCliMessage(cliError.message);
+    if (normalized !== 'gemini-cli 호출 중 오류가 발생했습니다.') {
+      return new Error(normalized);
+    }
   }
 
   return new Error('gemini-cli 호출에 실패했습니다.');
@@ -846,5 +917,133 @@ Generate comments for these symbols: ${symbolList}`;
   } catch (error) {
     console.error('[generateBatchComments] Error:', error);
     handleApiError(error, 'API 사용 한도가 초과되었습니다.');
+  }
+}
+
+function formatSignedPercent(value: number | undefined): string {
+  if (value === undefined || Number.isNaN(value)) {
+    return 'n/a';
+  }
+  return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+function sanitizeAiText(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+export async function generateAdvancedAnalyticsExplanation(
+  dashboardData: DashboardData,
+  modelName: GeminiModelName = DEFAULT_GEMINI_MODEL
+): Promise<AdvancedAnalyticsExplanation> {
+  const indicators = Object.values(dashboardData.indicators).map((indicator) => {
+    const short = indicator.changePercent;
+    const mid = indicator.changePercent7d ?? short;
+    const long = indicator.changePercent30d ?? mid;
+    const trendScore = short * 0.2 + mid * 0.3 + long * 0.5;
+    const volatility = calculateHistoryVolatility(indicator.history);
+
+    return {
+      symbol: indicator.symbol,
+      name: indicator.name,
+      current: indicator.value,
+      unit: indicator.unit || '',
+      short,
+      mid,
+      long,
+      trendScore,
+      volatility,
+    };
+  });
+
+  const strongestSignals = [...indicators]
+    .sort((a, b) => Math.abs(b.trendScore) - Math.abs(a.trendScore))
+    .slice(0, 8);
+  const highestVolatility = [...indicators]
+    .sort((a, b) => (b.volatility ?? -1) - (a.volatility ?? -1))
+    .slice(0, 8);
+
+  const indicatorSummary = indicators
+    .map((indicator) => {
+      const unitText = indicator.unit ? ` ${indicator.unit}` : '';
+      return [
+        `${indicator.symbol} (${indicator.name})`,
+        `현재=${indicator.current.toFixed(2)}${unitText}`.trim(),
+        `단기=${formatSignedPercent(indicator.short)}`,
+        `중기=${formatSignedPercent(indicator.mid)}`,
+        `장기=${formatSignedPercent(indicator.long)}`,
+        `추세점수=${indicator.trendScore.toFixed(2)}`,
+        `변동성=${indicator.volatility !== null ? `${indicator.volatility.toFixed(2)}%` : 'n/a'}`,
+      ].join(' | ');
+    })
+    .join('\n');
+
+  const prompt = `You are a macro strategist explaining chart analytics to Korean users.
+
+Input timestamp: ${dashboardData.timestamp}
+
+All indicators (short=1D/1M, mid=7D/2M, long=30D/3M):
+${indicatorSummary}
+
+Top absolute trend scores:
+${strongestSignals.map((item) => `${item.symbol}:${item.trendScore.toFixed(2)}`).join(', ')}
+
+Top volatility indicators:
+${highestVolatility
+    .map((item) => `${item.symbol}:${item.volatility !== null ? item.volatility.toFixed(2) : 'n/a'}%`)
+    .join(', ')}
+
+Instructions:
+1) Explain what the "Period Change Comparison" chart means and what current numbers imply.
+2) Explain what the "Volatility & Trend Score" chart means and what current numbers imply.
+3) Provide concise, concrete insights for decision support.
+4) Korean only. No markdown.
+
+Return ONLY valid JSON:
+{
+  "summary": "2-3문장",
+  "periodComparison": "2-3문장",
+  "volatilityTrend": "2-3문장",
+  "topSignals": ["핵심 신호 1", "핵심 신호 2", "핵심 신호 3", "핵심 신호 4"]
+}`;
+
+  try {
+    const text = await runGeminiCliPrompt(prompt, modelName);
+    const parsed = parseJsonFromResponse<{
+      summary?: unknown;
+      periodComparison?: unknown;
+      volatilityTrend?: unknown;
+      topSignals?: unknown;
+    }>(text);
+
+    const topSignals = Array.isArray(parsed.topSignals)
+      ? parsed.topSignals
+          .map((item) => (typeof item === 'string' ? item.trim() : ''))
+          .filter((item) => item.length > 0)
+          .slice(0, 6)
+      : [];
+
+    return {
+      summary: sanitizeAiText(parsed.summary, '핵심 지표들의 방향이 혼재되어 있어 단기 변동성 관리가 중요합니다.'),
+      periodComparison: sanitizeAiText(
+        parsed.periodComparison,
+        '기간별 변화율 비교에서는 단기 반등과 장기 추세가 같은 방향인지 먼저 확인해야 합니다.'
+      ),
+      volatilityTrend: sanitizeAiText(
+        parsed.volatilityTrend,
+        '변동성 대비 추세점수가 낮아지면 신호 신뢰도가 떨어질 수 있어 보수적 대응이 필요합니다.'
+      ),
+      topSignals:
+        topSignals.length > 0
+          ? topSignals
+          : ['핵심 신호를 생성하지 못했습니다. 잠시 후 다시 시도해주세요.'],
+      generatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error('[generateAdvancedAnalyticsExplanation] Error:', error);
+    handleApiError(error, 'API 사용 한도가 초과되었습니다. 잠시 후 다시 시도해주세요.');
   }
 }

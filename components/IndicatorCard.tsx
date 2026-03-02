@@ -1,5 +1,6 @@
 import { IndicatorData } from '@/lib/types/indicators';
 import MiniChart from './MiniChart';
+import { getIndicatorTooltipKo } from '@/lib/constants/chart-tooltips-ko';
 
 interface IndicatorCardProps {
   indicator: IndicatorData;
@@ -31,6 +32,8 @@ export default function IndicatorCard({ indicator, aiComment, isLoadingComments 
     return history.filter(point => new Date(point.date) >= cutoffDate);
   };
 
+  const tooltipDescription = getIndicatorTooltipKo(indicator.symbol, indicator.name);
+
   return (
     <div
       className="glass-card rounded-xl p-6 h-full flex flex-col gap-4 opacity-0 group"
@@ -41,8 +44,8 @@ export default function IndicatorCard({ indicator, aiComment, isLoadingComments 
     >
       <div className="flex flex-col gap-4 flex-1">
         <div className="flex items-start justify-between">
-          <div>
-            <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-300">
+          <div title={tooltipDescription}>
+            <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-300 cursor-help">
               {indicator.name}
             </h3>
             <p className="text-xs text-zinc-400 dark:text-zinc-400 mt-1">
@@ -134,6 +137,8 @@ export default function IndicatorCard({ indicator, aiComment, isLoadingComments 
                   ? indicator.history.slice(-12) // Monthly data: show last 12 entries (12 months)
                   : getFilteredHistory(indicator.history, 30) // Daily data: show last 30 calendar days
               }
+              symbol={indicator.symbol}
+              label={indicator.name}
               isPositive={
                 isMonthlyData && indicator.history.length >= 2
                   ? indicator.history[indicator.history.length - 1].value >= indicator.history[0].value // 12-month change

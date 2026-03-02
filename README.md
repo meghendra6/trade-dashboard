@@ -12,6 +12,8 @@
 - **26개 핵심 지표**: 매크로 경제(8개) + 주식시장(3개) + 원자재/자산(4개) + 리스크(2개) + 한국 관련(3개) + 한국 특화(5개) + 제조업 심리(1개)
 - **다기간 변화율**: 1D/7D/30D (일별), 1M/2M/3M (월별)
 - **추세 차트**: 30일/12개월 히스토리 시각화
+- **카테고리 그룹 뷰**: 지표 카드를 카테고리별 섹션으로 그룹화해 가독성 개선
+- **차트명 한글 툴팁**: 차트 이름 mouse over 시 지표 의미를 한국어로 간단 설명
 - **데이터 다운로드**: 지표 데이터 JSON 파일 내보내기
 
 ### 🤖 AI 시장 분석
@@ -19,6 +21,7 @@
 - **Google Search 통합**: Fed, 정부 공식 발표 자동 검색
 - **3-Tier 가중치 시스템**: 지표(50%) + 공식발표(25%) + 전문가 의견(25%)
 - **💬 지표별 AI 인사이트**: 각 지표의 변화 원인 및 예측 영향 분석 (1-2문장)
+- **🧠 Advanced Analytics AI 해설**: 기간비교/변동성 그래프 의미와 핵심 신호 요약 제공
 - **모델 선택**: `gemini-3-flash-preview` / `gemini-3.1-pro-preview` 중 선택
 - **24시간 캐싱**: Upstash Redis 기반 영구 캐시 + Fallback 메커니즘
 
@@ -139,7 +142,7 @@ npm run lint   # ESLint 검사
 ```
 trade-dashboard/
 ├── app/                  # Next.js App Router
-│   ├── api/             # API 라우트 (indicators, ai-prediction)
+│   ├── api/             # API 라우트 (indicators, ai-prediction, indicator-comments, advanced-analytics-explanations)
 │   └── page.tsx         # 메인 페이지
 ├── components/          # React 컴포넌트 (Dashboard, IndicatorCard, AIPrediction)
 ├── lib/

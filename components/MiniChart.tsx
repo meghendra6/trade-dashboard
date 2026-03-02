@@ -2,13 +2,16 @@
 
 import { HistoricalDataPoint } from '@/lib/types/indicators';
 import { LineChart, Line, ResponsiveContainer, YAxis, XAxis, Tooltip, CartesianGrid } from 'recharts';
+import { getIndicatorLabelKo } from '@/lib/constants/chart-tooltips-ko';
 
 interface MiniChartProps {
   data: HistoricalDataPoint[];
   isPositive: boolean;
+  symbol?: string;
+  label?: string;
 }
 
-export default function MiniChart({ data, isPositive }: MiniChartProps) {
+export default function MiniChart({ data, isPositive, symbol, label }: MiniChartProps) {
   if (!data || data.length === 0) {
     return null;
   }
@@ -66,10 +69,13 @@ export default function MiniChart({ data, isPositive }: MiniChartProps) {
               color: '#fff',
               fontSize: '11px',
             }}
-            formatter={(value: number | undefined) => [(value ?? 0).toFixed(2), 'Value']}
+            formatter={(value: number | undefined) => [
+              (value ?? 0).toFixed(2),
+              `${getIndicatorLabelKo(symbol || '', label || '지표')} 값`,
+            ]}
             labelFormatter={(label: string) => {
               const date = new Date(label);
-              return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              return date.toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' });
             }}
           />
 

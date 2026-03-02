@@ -8,12 +8,20 @@ import {
   GeminiModelName,
   DEFAULT_GEMINI_MODEL
 } from '@/lib/constants/gemini-models';
+import { parseApiErrorMessage } from '@/lib/utils/api-error-message';
 
 const STORAGE_KEY = 'gemini-model-preference';
 const STORAGE_MIGRATION_KEY = 'gemini-model-preference-pro-default-migrated';
 
 interface AIPredictionProps {
   dashboardData: DashboardData;
+}
+
+function statusFallbackMessage(status: number): string {
+  if (status === 429) return 'API 사용 한도가 초과되었습니다. 잠시 후 다시 시도해주세요.';
+  if (status === 503) return '현재 AI 분석 요청이 많습니다. 잠시 후 다시 시도해주세요.';
+  if (status >= 500) return 'AI 분석 생성에 실패했습니다. 잠시 후 다시 시도해주세요.';
+  return '요청 처리 중 오류가 발생했습니다.';
 }
 
 export default function AIPrediction({ dashboardData }: AIPredictionProps) {
@@ -74,14 +82,8 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-
-        // Check if it's a quota error
-        if (errorData.isQuotaError || response.status === 429) {
-          throw new Error(errorData.message || 'API 사용 한도가 초과되었습니다.');
-        }
-
-        throw new Error(errorData.message || 'Failed to fetch AI prediction');
+        const message = await parseApiErrorMessage(response, statusFallbackMessage);
+        throw new Error(message);
       }
 
       const data: MarketPrediction = await response.json();

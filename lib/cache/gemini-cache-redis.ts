@@ -1,11 +1,20 @@
 import { Redis } from '@upstash/redis';
+import { createHash } from 'node:crypto';
 import { DashboardData } from '../types/indicators';
 import { MarketPrediction } from '../api/gemini';
+import { AdvancedAnalyticsExplanation } from '../types/indicators';
 import { DEFAULT_GEMINI_MODEL } from '../constants/gemini-models';
 
 interface CachedPrediction {
   prediction: MarketPrediction;
   timestamp: number;
+  dataHash: string;
+}
+
+interface CachedAdvancedAnalyticsExplanation {
+  explanation: AdvancedAnalyticsExplanation;
+  timestamp: number;
+  modelName: string;
   dataHash: string;
 }
 
@@ -41,6 +50,12 @@ const FALLBACK_PREFIX = 'gemini:fallback:';
 const FALLBACK_INDEX_KEY = 'gemini:fallback:index';
 const TTL_SECONDS = 24 * 60 * 60; // 24 hours
 const MAX_FALLBACK_ENTRIES = 50;
+const ADVANCED_EXPLANATION_PREFIX = 'gemini:advanced:explanation:';
+const ADVANCED_EXPLANATION_INDEX_KEY = 'gemini:advanced:explanation:index';
+const ADVANCED_EXPLANATION_FALLBACK_PREFIX = 'gemini:advanced:fallback:';
+const ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY = 'gemini:advanced:fallback:index';
+const ADVANCED_EXPLANATION_TTL_SECONDS = 6 * 60 * 60; // 6 hours
+const MAX_ADVANCED_EXPLANATION_ENTRIES = 30;
 const SIMILARITY_KEYS = [
   'us10y',
   'us2y',
@@ -169,34 +184,103 @@ class GeminiCacheRedis {
     }
   }
 
+  async getAdvancedAnalyticsExplanation(
+    dashboardData: DashboardData,
+    modelName: string
+  ): Promise<AdvancedAnalyticsExplanation | null> {
+    const hash = this.hashAdvancedExplanationData(dashboardData, modelName);
+    const key = `${ADVANCED_EXPLANATION_PREFIX}${hash}`;
+
+    try {
+      const cached = await this.redis.get<CachedAdvancedAnalyticsExplanation>(key);
+      if (!cached) {
+        console.log('[GeminiCacheRedis] Advanced analytics explanation cache miss:', hash);
+        return null;
+      }
+
+      const age = Math.round((Date.now() - cached.timestamp) / 1000);
+      console.log(`[GeminiCacheRedis] Advanced analytics explanation cache hit: ${hash} (age: ${age}s)`);
+      return cached.explanation;
+    } catch (error) {
+      console.error('[GeminiCacheRedis] Error getting advanced analytics explanation:', error);
+      return null;
+    }
+  }
+
+  async setAdvancedAnalyticsExplanation(
+    dashboardData: DashboardData,
+    explanation: AdvancedAnalyticsExplanation,
+    modelName: string
+  ): Promise<void> {
+    const hash = this.hashAdvancedExplanationData(dashboardData, modelName);
+    const key = `${ADVANCED_EXPLANATION_PREFIX}${hash}`;
+    const fallbackKey = `${ADVANCED_EXPLANATION_FALLBACK_PREFIX}${Date.now()}`;
+
+    const cached: CachedAdvancedAnalyticsExplanation = {
+      explanation,
+      timestamp: Date.now(),
+      modelName,
+      dataHash: hash,
+    };
+
+    try {
+      await this.redis.set(key, cached, { ex: ADVANCED_EXPLANATION_TTL_SECONDS });
+      await this.redis.lpush(ADVANCED_EXPLANATION_INDEX_KEY, key);
+      await this.redis.ltrim(ADVANCED_EXPLANATION_INDEX_KEY, 0, MAX_ADVANCED_EXPLANATION_ENTRIES - 1);
+      await this.redis.expire(ADVANCED_EXPLANATION_INDEX_KEY, ADVANCED_EXPLANATION_TTL_SECONDS);
+
+      await this.redis.set(fallbackKey, cached, { ex: ADVANCED_EXPLANATION_TTL_SECONDS });
+      await this.redis.lpush(ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY, fallbackKey);
+      await this.redis.ltrim(
+        ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY,
+        0,
+        MAX_ADVANCED_EXPLANATION_ENTRIES - 1
+      );
+      await this.redis.expire(
+        ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY,
+        ADVANCED_EXPLANATION_TTL_SECONDS
+      );
+
+      console.log(`[GeminiCacheRedis] Cached advanced analytics explanation: ${hash}`);
+    } catch (error) {
+      console.error('[GeminiCacheRedis] Error setting advanced analytics explanation:', error);
+    }
+  }
+
   /**
    * Parse hash string back to numeric values
    */
   private parseHash(hash: string): ParsedHash | null {
-    const parsed = JSON.parse(hash);
+    let parsed: Record<string, string | number | undefined>;
+    try {
+      parsed = JSON.parse(hash) as Record<string, string | number | undefined>;
+    } catch {
+      return null;
+    }
+
     const parsedHash: ParsedHash = {
-      model: parsed.model || DEFAULT_GEMINI_MODEL,
-      us10y: parseFloat(parsed.us10y),
-      us2y: parseFloat(parsed.us2y),
-      t10y2y: parseFloat(parsed.t10y2y),
-      dxy: parseFloat(parsed.dxy),
-      spread: parseFloat(parsed.spread),
-      m2: parseFloat(parsed.m2),
-      spx: parseFloat(parsed.spx),
-      rut: parseFloat(parsed.rut),
-      oil: parseFloat(parsed.oil),
-      move: parseFloat(parsed.move),
-      ratio: parseFloat(parsed.ratio),
-      pmi: parseFloat(parsed.pmi),
-      vix: parseFloat(parsed.vix),
-      btc: parseFloat(parsed.btc),
-      usdkrw: parseFloat(parsed.usdkrw),
-      kospi: parseFloat(parsed.kospi),
-      kosdaq: parseFloat(parsed.kosdaq),
-      kr3y: parseFloat(parsed.kr3y),
-      kr10y: parseFloat(parsed.kr10y),
-      krsemi: parseFloat(parsed.krsemi),
-      krtb: parseFloat(parsed.krtb),
+      model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_GEMINI_MODEL,
+      us10y: Number(parsed.us10y),
+      us2y: Number(parsed.us2y),
+      t10y2y: Number(parsed.t10y2y),
+      dxy: Number(parsed.dxy),
+      spread: Number(parsed.spread),
+      m2: Number(parsed.m2),
+      spx: Number(parsed.spx),
+      rut: Number(parsed.rut),
+      oil: Number(parsed.oil),
+      move: Number(parsed.move),
+      ratio: Number(parsed.ratio),
+      pmi: Number(parsed.pmi),
+      vix: Number(parsed.vix),
+      btc: Number(parsed.btc),
+      usdkrw: Number(parsed.usdkrw),
+      kospi: Number(parsed.kospi),
+      kosdaq: Number(parsed.kosdaq),
+      kr3y: Number(parsed.kr3y),
+      kr10y: Number(parsed.kr10y),
+      krsemi: Number(parsed.krsemi),
+      krtb: Number(parsed.krtb),
     };
 
     for (const key of SIMILARITY_KEYS) {
@@ -318,6 +402,43 @@ class GeminiCacheRedis {
       await this.redis.lpush(FALLBACK_INDEX_KEY, limitedLegacyKeys[i]);
     }
     await this.redis.expire(FALLBACK_INDEX_KEY, TTL_SECONDS);
+
+    return limitedLegacyKeys;
+  }
+
+  private async getIndexedAdvancedFallbackKeys(): Promise<string[]> {
+    const indexedKeys = await this.redis.lrange<string>(
+      ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY,
+      0,
+      MAX_ADVANCED_EXPLANATION_ENTRIES - 1
+    );
+    const filteredIndexedKeys = indexedKeys.filter((key) =>
+      key.startsWith(ADVANCED_EXPLANATION_FALLBACK_PREFIX)
+    );
+    if (filteredIndexedKeys.length > 0) {
+      return filteredIndexedKeys;
+    }
+
+    const legacyKeys = await this.redis.keys(`${ADVANCED_EXPLANATION_FALLBACK_PREFIX}*`);
+    if (legacyKeys.length === 0) {
+      return [];
+    }
+
+    const sortedLegacyKeys = legacyKeys.sort((a, b) => {
+      const tsA = Number.parseInt(a.replace(ADVANCED_EXPLANATION_FALLBACK_PREFIX, ''), 10);
+      const tsB = Number.parseInt(b.replace(ADVANCED_EXPLANATION_FALLBACK_PREFIX, ''), 10);
+      return tsB - tsA;
+    });
+    const limitedLegacyKeys = sortedLegacyKeys.slice(0, MAX_ADVANCED_EXPLANATION_ENTRIES);
+
+    await this.redis.del(ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY);
+    for (let i = limitedLegacyKeys.length - 1; i >= 0; i--) {
+      await this.redis.lpush(ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY, limitedLegacyKeys[i]);
+    }
+    await this.redis.expire(
+      ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY,
+      ADVANCED_EXPLANATION_TTL_SECONDS
+    );
 
     return limitedLegacyKeys;
   }
@@ -445,6 +566,41 @@ class GeminiCacheRedis {
   /**
    * Hash dashboard data for cache key
    */
+  private hashAdvancedExplanationData(data: DashboardData, modelName: string): string {
+    const normalizedIndicators = Object.keys(data.indicators)
+      .sort()
+      .map((key) => {
+        const indicator = data.indicators[key as keyof DashboardData['indicators']];
+        const historySignature = (indicator.history || [])
+          .map((point) => `${point.date}:${point.value.toFixed(4)}`)
+          .join('|');
+
+        return {
+          key,
+          value: Number(indicator.value.toFixed(4)),
+          changePercent: Number(indicator.changePercent.toFixed(4)),
+          changePercent7d:
+            indicator.changePercent7d !== undefined
+              ? Number(indicator.changePercent7d.toFixed(4))
+              : null,
+          changePercent30d:
+            indicator.changePercent30d !== undefined
+              ? Number(indicator.changePercent30d.toFixed(4))
+              : null,
+          lastUpdated: indicator.lastUpdated,
+          historySignature,
+        };
+      });
+
+    const raw = JSON.stringify({
+      model: modelName,
+      timestamp: data.timestamp,
+      indicators: normalizedIndicators,
+    });
+
+    return createHash('sha256').update(raw).digest('hex');
+  }
+
   private hashData(data: DashboardData, modelName: string): string {
     const rounded = {
       model: modelName,
@@ -477,18 +633,36 @@ class GeminiCacheRedis {
   /**
    * Get cache statistics
    */
-  async getStats(): Promise<{ predictionKeys: number; fallbackKeys: number }> {
+  async getStats(): Promise<{
+    predictionKeys: number;
+    fallbackKeys: number;
+    advancedExplanationKeys: number;
+    advancedFallbackKeys: number;
+  }> {
     try {
       const predictionKeys = await this.redis.lrange<string>(PREDICTION_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
       const fallbackKeys = await this.getIndexedFallbackKeys();
+      const advancedExplanationKeys = await this.redis.lrange<string>(
+        ADVANCED_EXPLANATION_INDEX_KEY,
+        0,
+        MAX_ADVANCED_EXPLANATION_ENTRIES - 1
+      );
+      const advancedFallbackKeys = await this.getIndexedAdvancedFallbackKeys();
 
       return {
         predictionKeys: predictionKeys.length,
         fallbackKeys: fallbackKeys.length,
+        advancedExplanationKeys: advancedExplanationKeys.length,
+        advancedFallbackKeys: advancedFallbackKeys.length,
       };
     } catch (error) {
       console.error('[GeminiCacheRedis] Error getting stats:', error);
-      return { predictionKeys: 0, fallbackKeys: 0 };
+      return {
+        predictionKeys: 0,
+        fallbackKeys: 0,
+        advancedExplanationKeys: 0,
+        advancedFallbackKeys: 0,
+      };
     }
   }
 
@@ -499,14 +673,24 @@ class GeminiCacheRedis {
     try {
       const predictionKeys = await this.redis.lrange<string>(PREDICTION_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
       const fallbackKeys = await this.getIndexedFallbackKeys();
+      const advancedExplanationKeys = await this.redis.lrange<string>(
+        ADVANCED_EXPLANATION_INDEX_KEY,
+        0,
+        MAX_ADVANCED_EXPLANATION_ENTRIES - 1
+      );
+      const advancedFallbackKeys = await this.getIndexedAdvancedFallbackKeys();
       const legacyKeys = await this.redis.keys('gemini:*');
       const allKeys = Array.from(
         new Set([
           ...predictionKeys,
           ...fallbackKeys,
+          ...advancedExplanationKeys,
+          ...advancedFallbackKeys,
           ...legacyKeys,
           PREDICTION_INDEX_KEY,
           FALLBACK_INDEX_KEY,
+          ADVANCED_EXPLANATION_INDEX_KEY,
+          ADVANCED_EXPLANATION_FALLBACK_INDEX_KEY,
         ])
       );
 
