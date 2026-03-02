@@ -18,9 +18,9 @@
 
 ### 🤖 AI 시장 분석
 - **Gemini CLI 연동**: 로컬 인증된 `gemini-cli`로 AI 분석 실행
-- **Google Search 통합**: Fed, 정부 공식 발표 자동 검색
+- **Google Search 통합(선택)**: 정책 엔진/도구 설정 시 Fed·정부 공식 발표 검색 보강
 - **3-Tier 가중치 시스템**: 지표(50%) + 공식발표(25%) + 전문가 의견(25%)
-- **💬 지표별 AI 인사이트**: 각 지표의 변화 원인 및 예측 영향 분석 (1-2문장)
+- **💬 지표별 AI 인사이트**: 각 지표의 변화 원인·전이 경로·체크포인트 분석 (3문장)
 - **🧠 Advanced Analytics AI 해설**: 기간비교/변동성 그래프 의미와 핵심 신호 요약 제공
 - **모델 선택**: `gemini-3-flash-preview` / `gemini-3.1-pro-preview` 중 선택
 - **24시간 캐싱**: Upstash Redis 기반 영구 캐시 + Fallback 메커니즘
@@ -64,9 +64,16 @@ UPSTASH_REDIS_REST_TOKEN=your_token
 # Optional (gemini-cli runtime tuning)
 GEMINI_CLI_PATH=/opt/homebrew/bin/gemini
 GEMINI_CLI_TIMEOUT_MS=180000
-GEMINI_CLI_MAX_CONCURRENCY=2
+GEMINI_CLI_MAX_CONCURRENCY=1
 GEMINI_CLI_MAX_QUEUE_DEPTH=50
-GEMINI_CLI_ALLOWED_TOOLS=google_web_search
+# Optional: 429/과부하 완화를 위한 재시도/스로틀링
+GEMINI_CLI_MAX_RETRY_ATTEMPTS=3
+GEMINI_CLI_RETRY_BASE_DELAY_MS=1200
+GEMINI_CLI_RETRY_MAX_DELAY_MS=10000
+GEMINI_CLI_MIN_REQUEST_INTERVAL_MS=1200
+
+# Optional: 명시적으로 도구를 제한하고 싶을 때만 설정 (기본 비활성화)
+# GEMINI_CLI_ALLOWED_TOOLS=google_web_search
 
 # Rate limit mode A: 프록시 없이 직접 접속(간단)
 RATE_LIMIT_TRUST_PROXY_HEADERS=0
@@ -162,7 +169,7 @@ trade-dashboard/
 - **TERTIARY (25%)**: 애널리스트 의견
 
 **지표별 AI 인사이트**:
-- 각 지표의 변화 원인과 예측 영향을 1-2문장으로 설명
+- 각 지표를 원인 → 영향 전이 → 단기 체크포인트 3문장으로 설명
 - 단일 API 호출로 26개 지표 모두 분석 (추가 비용 없음)
 - 한국어로 제공, 차트 하단에 표시
 

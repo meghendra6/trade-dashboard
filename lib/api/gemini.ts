@@ -8,6 +8,9 @@ const execFileAsync = promisify(execFile);
 const GEMINI_CLI_COMMAND = process.env.GEMINI_CLI_PATH || 'gemini';
 const GEMINI_CLI_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const QUOTA_ERROR_PATTERNS = ['quota', 'rate limit', '429', 'resource exhausted', 'too many requests'];
+const GEMINI_CLI_DEPRECATED_ALLOWED_TOOLS_WARNING_PATTERN =
+  /Warning:\s+--allowed-tools cli argument and tools\.allowed in settings\.json are deprecated[^]*?policy-engine\/?/g;
+const GEMINI_CLI_CREDENTIALS_LOG_PATTERN = /Loaded cached credentials\./g;
 
 function readBoundedIntegerEnv(
   key: string,
@@ -26,12 +29,17 @@ function readBoundedIntegerEnv(
   return parsed;
 }
 
-const GEMINI_CLI_TIMEOUT_MS = readBoundedIntegerEnv('GEMINI_CLI_TIMEOUT_MS', 360000, 5000, 300000);
-const GEMINI_CLI_MAX_CONCURRENCY = readBoundedIntegerEnv('GEMINI_CLI_MAX_CONCURRENCY', 2, 1, 10);
+const GEMINI_CLI_TIMEOUT_MS = readBoundedIntegerEnv('GEMINI_CLI_TIMEOUT_MS', 180000, 5000, 300000);
+const GEMINI_CLI_MAX_CONCURRENCY = readBoundedIntegerEnv('GEMINI_CLI_MAX_CONCURRENCY', 1, 1, 10);
 const GEMINI_CLI_MAX_QUEUE_DEPTH = readBoundedIntegerEnv('GEMINI_CLI_MAX_QUEUE_DEPTH', 50, 1, 1000);
-const GEMINI_CLI_ALLOWED_TOOLS = (process.env.GEMINI_CLI_ALLOWED_TOOLS || 'google_web_search').trim();
+const GEMINI_CLI_MAX_RETRY_ATTEMPTS = readBoundedIntegerEnv('GEMINI_CLI_MAX_RETRY_ATTEMPTS', 3, 1, 6);
+const GEMINI_CLI_RETRY_BASE_DELAY_MS = readBoundedIntegerEnv('GEMINI_CLI_RETRY_BASE_DELAY_MS', 1200, 100, 30000);
+const GEMINI_CLI_RETRY_MAX_DELAY_MS = readBoundedIntegerEnv('GEMINI_CLI_RETRY_MAX_DELAY_MS', 10000, 500, 120000);
+const GEMINI_CLI_MIN_REQUEST_INTERVAL_MS = readBoundedIntegerEnv('GEMINI_CLI_MIN_REQUEST_INTERVAL_MS', 1200, 0, 60000);
+const GEMINI_CLI_ALLOWED_TOOLS = (process.env.GEMINI_CLI_ALLOWED_TOOLS || '').trim();
 let activeCliRequests = 0;
 const cliRequestQueue: Array<() => void> = [];
+let nextCliRequestAtMs = 0;
 
 export class GeminiQueueFullError extends Error {
   constructor() {
@@ -164,9 +172,25 @@ interface ExecFileFailure extends Error {
   killed?: boolean;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function toText(chunk: string | Buffer | undefined): string {
   if (!chunk) return '';
   return typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+}
+
+function stripKnownCliNoise(raw: string): string {
+  if (!raw) return raw;
+
+  return raw
+    .replace(GEMINI_CLI_DEPRECATED_ALLOWED_TOOLS_WARNING_PATTERN, '')
+    .replace(GEMINI_CLI_CREDENTIALS_LOG_PATTERN, '')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .join('\n');
 }
 
 function isQuotaLikeMessage(message: string): boolean {
@@ -222,7 +246,7 @@ function extractJsonObjects(text: string): string[] {
 }
 
 function parseGeminiCliJson(text: string): GeminiCliJsonOutput | null {
-  const trimmed = text.trim();
+  const trimmed = stripKnownCliNoise(text).trim();
   if (!trimmed) return null;
 
   const candidates = [trimmed, ...extractJsonObjects(trimmed).reverse()];
@@ -242,7 +266,7 @@ function parseGeminiCliJson(text: string): GeminiCliJsonOutput | null {
 }
 
 function sanitizeCliMessage(raw: string): string {
-  const firstLine = raw
+  const firstLine = stripKnownCliNoise(raw)
     .split('\n')
     .map((line) => line.trim())
     .find((line) => line.length > 0 && !line.startsWith('at '));
@@ -312,7 +336,8 @@ function normalizeUnknownErrorMessage(
 }
 
 function parseGeminiCliResponse(stdout: string): string {
-  const parsed = parseGeminiCliJson(stdout);
+  const cleanedStdout = stripKnownCliNoise(stdout);
+  const parsed = parseGeminiCliJson(cleanedStdout);
 
   if (parsed?.error) {
     throw new Error(normalizeUnknownErrorMessage(parsed.error.message || parsed.error));
@@ -329,7 +354,7 @@ function parseGeminiCliResponse(stdout: string): string {
     }
   }
 
-  const fallback = stdout.trim();
+  const fallback = cleanedStdout.trim();
   if (!fallback) {
     throw new Error('No text output from gemini-cli');
   }
@@ -342,8 +367,8 @@ function buildGeminiCliError(error: unknown): Error {
   }
 
   const cliError = error as ExecFileFailure;
-  const stdout = toText(cliError.stdout);
-  const stderr = toText(cliError.stderr);
+  const stdout = stripKnownCliNoise(toText(cliError.stdout));
+  const stderr = stripKnownCliNoise(toText(cliError.stderr));
   const parsedStdout = parseGeminiCliJson(stdout);
   const parsedStderr = parseGeminiCliJson(stderr);
 
@@ -387,6 +412,31 @@ function buildGeminiCliError(error: unknown): Error {
   return new Error('gemini-cli 호출에 실패했습니다.');
 }
 
+function shouldRetryGeminiCliError(error: Error): boolean {
+  const normalized = error.message.toLowerCase();
+  return (
+    isQuotaLikeMessage(normalized) ||
+    normalized.includes('temporar') ||
+    normalized.includes('service unavailable') ||
+    normalized.includes('internal error') ||
+    normalized.includes('invalid response format') ||
+    normalized.includes('no text output from gemini-cli') ||
+    normalized.includes('econnreset') ||
+    normalized.includes('etimedout') ||
+    normalized.includes('socket hang up')
+  );
+}
+
+function calculateRetryDelayMs(attempt: number): number {
+  const exponential = Math.min(
+    GEMINI_CLI_RETRY_MAX_DELAY_MS,
+    GEMINI_CLI_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1)
+  );
+  const jitterCap = Math.max(100, Math.floor(exponential * 0.2));
+  const jitter = Math.floor(Math.random() * jitterCap);
+  return Math.min(GEMINI_CLI_RETRY_MAX_DELAY_MS, exponential + jitter);
+}
+
 async function acquireCliSlot(): Promise<void> {
   if (activeCliRequests < GEMINI_CLI_MAX_CONCURRENCY) {
     activeCliRequests++;
@@ -412,6 +462,19 @@ function releaseCliSlot(): void {
   }
 }
 
+async function enforceCliRequestInterval(): Promise<void> {
+  if (GEMINI_CLI_MIN_REQUEST_INTERVAL_MS <= 0) return;
+
+  const now = Date.now();
+  const scheduledAt = Math.max(nextCliRequestAtMs, now);
+  nextCliRequestAtMs = scheduledAt + GEMINI_CLI_MIN_REQUEST_INTERVAL_MS;
+
+  const waitMs = scheduledAt - now;
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+}
+
 function buildGeminiCliArgs(prompt: string, modelName: GeminiModelName): string[] {
   const args = ['-m', modelName, '-p', prompt, '--output-format', 'json'];
   if (GEMINI_CLI_ALLOWED_TOOLS) {
@@ -421,33 +484,58 @@ function buildGeminiCliArgs(prompt: string, modelName: GeminiModelName): string[
 }
 
 async function runGeminiCliPrompt(prompt: string, modelName: GeminiModelName): Promise<string> {
-  let slotAcquired = false;
+  let lastError: Error | null = null;
 
-  try {
-    await acquireCliSlot();
-    slotAcquired = true;
+  for (let attempt = 1; attempt <= GEMINI_CLI_MAX_RETRY_ATTEMPTS; attempt++) {
+    let slotAcquired = false;
+    let retryDelayMs = 0;
 
-    const { stdout } = await execFileAsync(
-      GEMINI_CLI_COMMAND,
-      buildGeminiCliArgs(prompt, modelName),
-      {
-        encoding: 'utf8',
-        timeout: GEMINI_CLI_TIMEOUT_MS,
-        maxBuffer: GEMINI_CLI_MAX_BUFFER_BYTES,
+    try {
+      await acquireCliSlot();
+      slotAcquired = true;
+      await enforceCliRequestInterval();
+
+      const { stdout } = await execFileAsync(
+        GEMINI_CLI_COMMAND,
+        buildGeminiCliArgs(prompt, modelName),
+        {
+          encoding: 'utf8',
+          timeout: GEMINI_CLI_TIMEOUT_MS,
+          maxBuffer: GEMINI_CLI_MAX_BUFFER_BYTES,
+        }
+      );
+
+      return parseGeminiCliResponse(toText(stdout));
+    } catch (error) {
+      if (error instanceof GeminiQueueFullError) {
+        throw error;
       }
-    );
 
-    return parseGeminiCliResponse(toText(stdout));
-  } catch (error) {
-    if (error instanceof GeminiQueueFullError) {
-      throw error;
+      const normalizedError = buildGeminiCliError(error);
+      lastError = normalizedError;
+
+      const shouldRetry =
+        attempt < GEMINI_CLI_MAX_RETRY_ATTEMPTS && shouldRetryGeminiCliError(normalizedError);
+      if (!shouldRetry) {
+        throw normalizedError;
+      }
+
+      retryDelayMs = calculateRetryDelayMs(attempt);
+      console.warn(
+        `[gemini-cli] Attempt ${attempt}/${GEMINI_CLI_MAX_RETRY_ATTEMPTS} failed: ${normalizedError.message}. Retrying in ${retryDelayMs}ms`
+      );
+    } finally {
+      if (slotAcquired) {
+        releaseCliSlot();
+      }
     }
-    throw buildGeminiCliError(error);
-  } finally {
-    if (slotAcquired) {
-      releaseCliSlot();
+
+    if (retryDelayMs > 0) {
+      await sleep(retryDelayMs);
     }
   }
+
+  throw lastError || new Error('gemini-cli 호출에 실패했습니다.');
 }
 
 export function getGeminiCliLoad(): { activeRequests: number; queuedRequests: number } {
@@ -546,9 +634,14 @@ export async function generateMarketPrediction(
     koreaTradeBalance,
   } = dashboardData.indicators;
 
-  // Generate dynamic date for search queries
+  // Generate time context for analysis prompt
   const now = new Date();
-  const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const analysisDateKst = now.toLocaleDateString('ko-KR', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'Asia/Seoul',
+  });
   const advancedSignals = [
     `US10Y: ${formatAdvancedSignal(us10yYield)}`,
     `US2Y: ${formatAdvancedSignal(us2yYield)}`,
@@ -578,222 +671,75 @@ export async function generateMarketPrediction(
     `VIX: ${formatAdvancedSignal(putCallRatio)}`,
   ].join('\n');
 
-  const prompt = `You are a professional financial market analyst. Provide a comprehensive market outlook by analyzing the following 26 economic and market indicators.
+  const prompt = `Role: You are a senior multi-asset macro strategist writing for Korean investors.
 
-=== Economic Indicators ===
+Data timestamp (source data): ${dashboardData.timestamp}
+Prompt generated at (KST): ${analysisDateKst}
 
-**Macro Indicators (Daily Data - 1D/7D/30D periods):**
-1. US 10-Year Treasury Yield: ${us10yYield.value.toFixed(2)}% (${formatPeriodChanges(us10yYield)})
-2. US 2-Year Treasury Yield: ${us2yYield.value.toFixed(2)}% (${formatPeriodChanges(us2yYield)})
-3. 10Y-2Y Yield Curve Spread: ${yieldCurveSpread.value.toFixed(2)}pp (${formatPeriodChanges(yieldCurveSpread)})
-4. US Dollar Index (DXY): ${dxy.value.toFixed(2)} (${formatPeriodChanges(dxy)})
-5. High Yield Spread: ${highYieldSpread.value.toFixed(2)} bps (${formatPeriodChanges(highYieldSpread)})
+Primary dataset (26 indicators, prioritize these values over narrative):
+[US Rates / Credit]
+- US10Y: ${us10yYield.value.toFixed(2)}% (${formatPeriodChanges(us10yYield)})
+- US2Y: ${us2yYield.value.toFixed(2)}% (${formatPeriodChanges(us2yYield)})
+- T10Y2Y: ${yieldCurveSpread.value.toFixed(2)}pp (${formatPeriodChanges(yieldCurveSpread)})
+- DXY: ${dxy.value.toFixed(2)} (${formatPeriodChanges(dxy)})
+- HYS: ${highYieldSpread.value.toFixed(2)}bps (${formatPeriodChanges(highYieldSpread)})
+- MOVE: ${moveIndex.value.toFixed(2)} (${formatPeriodChanges(moveIndex)})
+- VIX: ${putCallRatio.value.toFixed(2)} (${formatPeriodChanges(putCallRatio)})
 
-**Macro Indicators (Monthly Data - 1M/2M/3M periods):**
-6. M2 Money Supply: $${m2MoneySupply.value.toFixed(2)}B (${formatPeriodChanges(m2MoneySupply, true)})
-7. Consumer Price Index (CPI): ${cpi.value.toFixed(2)} (Index, Base 1982-1984=100) - (${formatPeriodChanges(cpi, true)})
-   → 인플레이션 추세 및 연준 통화정책 방향성의 핵심 지표
-8. Total Nonfarm Employment: ${payems.value.toFixed(2)}M persons - (1M change: ${payems.change >= 0 ? '+' : ''}${payems.change.toFixed(2)}M / ${payems.changePercent.toFixed(2)}%, 2M: ${payems.change7d && payems.change7d >= 0 ? '+' : ''}${payems.change7d?.toFixed(2)}M / ${payems.changePercent7d?.toFixed(2)}%, 3M: ${payems.change30d && payems.change30d >= 0 ? '+' : ''}${payems.change30d?.toFixed(2)}M / ${payems.changePercent30d?.toFixed(2)}%)
-   → 전체 비농업 고용자 수. 1M change는 월간 일자리 증감 (예: +0.05M = 50,000명 증가)
-   → 노동시장 건전성 및 경제 성장 모멘텀의 핵심 지표
+[US Macro (Monthly)]
+- M2: $${m2MoneySupply.value.toFixed(2)}B (${formatPeriodChanges(m2MoneySupply, true)})
+- CPI: ${cpi.value.toFixed(2)} (${formatPeriodChanges(cpi, true)})
+- PAYEMS: ${payems.value.toFixed(2)}M (${formatPeriodChanges(payems, true)})
+- MFG: ${pmi.value.toFixed(2)} (${formatPeriodChanges(pmi, true)})
 
-**US Equity Market Indicators (Daily Data - 1D/7D/30D periods):**
-9. S&P 500 Index: ${sp500.value.toFixed(2)} (${formatPeriodChanges(sp500)})
-10. Nasdaq Composite: ${nasdaq.value.toFixed(2)} (${formatPeriodChanges(nasdaq)})
-11. Russell 2000 Index: ${russell2000.value.toFixed(2)} (${formatPeriodChanges(russell2000)})
+[US Equities / Global Risk]
+- SPX: ${sp500.value.toFixed(2)} (${formatPeriodChanges(sp500)})
+- IXIC: ${nasdaq.value.toFixed(2)} (${formatPeriodChanges(nasdaq)})
+- RUT: ${russell2000.value.toFixed(2)} (${formatPeriodChanges(russell2000)})
+- BTC: $${bitcoin.value.toFixed(2)} (${formatPeriodChanges(bitcoin)})
 
-**Commodity & Asset Indicators (Daily Data - 1D/7D/30D periods):**
-12. Crude Oil (WTI): $${crudeOil.value.toFixed(2)}/barrel (${formatPeriodChanges(crudeOil)})
-13. Gold (COMEX): $${gold.value.toFixed(2)}/oz (${formatPeriodChanges(gold)})
-14. Copper/Gold Ratio: ${copperGoldRatio.value.toFixed(2)}×10000 (${formatPeriodChanges(copperGoldRatio)})
-15. Bitcoin (BTC/USD): $${bitcoin.value.toFixed(2)} (${formatPeriodChanges(bitcoin)})
+[Commodities]
+- OIL: $${crudeOil.value.toFixed(2)} (${formatPeriodChanges(crudeOil)})
+- GOLD: $${gold.value.toFixed(2)} (${formatPeriodChanges(gold)})
+- Cu/Au: ${copperGoldRatio.value.toFixed(2)}x10000 (${formatPeriodChanges(copperGoldRatio)})
 
-**Risk-Sensitive Indicators:**
-16. VIX - Fear Index (Daily Data - 1D/7D/30D periods): ${putCallRatio.value.toFixed(2)} (${formatPeriodChanges(putCallRatio)})
-17. MOVE Index - US Rate Volatility (Daily Data - 1D/7D/30D periods): ${moveIndex.value.toFixed(2)} (${formatPeriodChanges(moveIndex)})
+[Korea / Asia Spillover]
+- USDKRW: ${usdKrw.value.toFixed(2)} (${formatPeriodChanges(usdKrw)})
+- KOSPI: ${kospi.value.toFixed(2)} (${formatPeriodChanges(kospi)})
+- EWY: ${ewy.value.toFixed(2)} (${formatPeriodChanges(ewy)})
+- KOSDAQ: ${kosdaq.value.toFixed(2)} (${formatPeriodChanges(kosdaq)})
+- KR3Y: ${kr3yBond.value.toFixed(2)} (${formatPeriodChanges(kr3yBond)})
+- KR10Y: ${kr10yBond.value.toFixed(2)} (${formatPeriodChanges(kr10yBond)})
+- KRSEMI: ${koreaSemiconductorExportsProxy.value.toFixed(2)} (${formatPeriodChanges(koreaSemiconductorExportsProxy)})
+- KRTB: ${koreaTradeBalance.value.toFixed(2)} (${formatPeriodChanges(koreaTradeBalance, true)})
 
-**Korea-Related Indicators (Daily Data - 1D/7D/30D periods):**
-18. USD/KRW Exchange Rate: ${usdKrw.value.toFixed(2)} KRW/USD (${formatPeriodChanges(usdKrw)})
-19. KOSPI Composite: ${kospi.value.toFixed(2)} (${formatPeriodChanges(kospi)})
-20. iShares MSCI Korea ETF (EWY): ${ewy.value.toFixed(2)} (${formatPeriodChanges(ewy)})
-
-**Korea-Specialized Indicators:**
-21. KOSDAQ Composite: ${kosdaq.value.toFixed(2)} (${formatPeriodChanges(kosdaq)})
-22. KR 3Y Treasury Proxy (KTB ETF): ${kr3yBond.value.toFixed(2)} KRW (${formatPeriodChanges(kr3yBond)})
-23. KR 10Y Treasury Proxy (KTB ETF): ${kr10yBond.value.toFixed(2)} KRW (${formatPeriodChanges(kr10yBond)})
-24. Korea Semiconductor Exports Proxy (KODEX Semiconductor ETF): ${koreaSemiconductorExportsProxy.value.toFixed(2)} KRW (${formatPeriodChanges(koreaSemiconductorExportsProxy)})
-25. Korea Trade Balance (Commodities, Monthly): ${koreaTradeBalance.value.toFixed(2)} Trillion KRW (${formatPeriodChanges(koreaTradeBalance, true)})
-
-**Manufacturing Sentiment (Monthly Data - 1M/2M/3M periods):**
-26. Manufacturing Confidence - OECD: ${pmi.value.toFixed(2)} (${formatPeriodChanges(pmi, true)})
-
-=== Advanced Quantitative Signals (IMPORTANT SUPPORTING DATA) ===
-Use the additional signals below to increase accuracy, especially for momentum reversals and volatility regimes:
+Advanced quantitative signals (trend/volatility/recent series):
 ${advancedSignals}
 
-Interpretation requirements for this section:
-- Explicitly check if trend is consistent_uptrend / consistent_downtrend / mixed_trend
-- Use volatility to assess confidence level (high volatility = lower confidence, higher risk)
-- Use recent_series to verify whether latest movement is acceleration or mean reversion
+Strict reasoning protocol:
+1) Start with indicator evidence only. Create an internal scoreboard:
+   - risk_on_or_growth signals = n
+   - risk_off_or_slowdown signals = n
+   - inflation_or_tightening pressure signals = n
+2) Compare short/mid/long horizons (1D/7D/30D or 1M/2M/3M) and classify regime:
+   acceleration / deceleration / mean_reversion / divergence.
+3) Evaluate stress channels explicitly: T10Y2Y, HYS, MOVE, VIX.
+4) Evaluate Korea spillover explicitly: USDKRW, KOSPI/KOSDAQ, KR3Y/KR10Y, KRSEMI, KRTB.
+5) Web search is secondary confirmation only:
+   - Prefer official releases and major institutions from last 7 days.
+   - If confirmation is weak or conflicting, write: "확인 가능한 추가 이벤트는 제한적입니다."
+6) Never fabricate exact quotes, dates, targets, or institution views.
 
-=== Analysis Priority (CRITICAL) ===
-
-Your analysis MUST follow this strict priority order:
-
-**1. PRIMARY (50% weight): Economic Indicators**
-   - Base your core analysis on the 26 indicators' multi-period trends (1D/7D/30D or 1M/2M/3M)
-   - Indicator movements are the foundation of your market outlook
-   - Compare timeframes to identify momentum, trend reversals, and structural changes
-   - **CPI와 NFP는 연준 정책 결정의 핵심 변수이므로 특별히 주목**:
-     * CPI: 인플레이션 목표(2%) 대비 현황 평가
-     * NFP: 고용시장 과열/냉각 여부 판단
-   - **T10Y2Y, VIX, MOVE는 경기 둔화/금융 스트레스 조기 신호로 별도 점검**
-   - **USDKRW, KOSPI, KOSDAQ, EWY, KR3Y/KR10Y, KRSEMI, KRTB를 통해 한국/아시아 리스크 전이 여부를 함께 평가**
-   - KR3Y/KR10Y/KRSEMI are market-traded proxies, so interpret with caution and focus on direction/momentum
-   - 지표 간 상관관계 고려 (예: CPI↑ + NFP강세 → 긴축 압력 증가)
-
-**2. SECONDARY (25% weight): Official Announcements**
-   - Fed policy statements, FOMC decisions, interest rate announcements
-   - Major political/policy decisions (Trump statements, executive orders, trade policies, tariffs)
-   - Official economic data releases (CPI, PPI, unemployment, GDP, NFP)
-   - Government fiscal/regulatory policy changes
-   - Use these to explain WHY indicators are moving
-
-**3. TERTIARY (25% weight): Expert Opinions & Analyst Consensus**
-
-   **REQUIRED: Search and categorize expert opinions into three groups:**
-
-   🟢 **BULLISH/BUY Opinions:**
-   - Analysts recommending buying, increasing exposure, overweight positions
-   - Forecasts predicting market/index gains with specific price targets
-   - Optimistic outlooks from major investment banks
-
-   🔴 **BEARISH/SELL Opinions:**
-   - Analysts recommending selling, reducing exposure, underweight positions
-   - Forecasts predicting market/index declines with downside targets
-   - Cautious/pessimistic outlooks, recession warnings
-
-   ⚪ **NEUTRAL/HOLD Opinions:**
-   - Analysts recommending holding current positions
-   - Mixed or uncertain outlooks, wait-and-see recommendations
-
-   **Synthesis Method:**
-   - Count opinions in each category (e.g., "5 bullish, 2 bearish, 3 neutral")
-   - Identify consensus direction and confidence level
-   - Weight by source credibility: Major Investment Banks (Goldman Sachs, Morgan Stanley, JPMorgan) > Research Firms (Morningstar) > Independent Analysts
-   - Note significant contrarian views from credible sources
-
-=== Google Search Instructions ===
-
-You have access to real-time web search capabilities. Use them strategically:
-
-**REQUIRED SEARCHES - Official Announcements (25% weight):**
-- Search for latest Fed announcements, FOMC decisions, or interest rate changes
-- Search for recent Trump policy statements, executive orders, or trade policy changes
-- Search for official U.S. economic data releases (CPI, PPI, unemployment, GDP) from the last 7 days
-- Search for major geopolitical events affecting markets (tariffs, sanctions, conflicts)
-
-**REQUIRED SEARCHES - Expert Opinions (25% weight):**
-- Search for "S&P 500 analyst forecast 2026" or "stock market outlook 2026"
-- Search for "Wall Street investment bank recommendation"
-- Search for "Goldman Sachs market outlook" or "Morgan Stanley forecast"
-- Search for "analyst buy sell rating stock market"
-
-**Search Query Examples:**
-- "Fed interest rate decision ${monthYear}"
-- "Trump tariff announcement this week"
-- "US CPI inflation data latest"
-- "FOMC statement recent"
-- "Wall Street analyst stock market forecast ${monthYear}"
-- "Goldman Sachs S&P 500 target 2026"
-- "investment bank bullish bearish outlook"
-
-**Search Guidelines:**
-1. Search for BOTH official announcements AND expert opinions
-2. Focus on events/opinions from the **last 7 days** for maximum relevance
-3. For official news: Verify source credibility (Fed.gov, WhiteHouse.gov, BLS.gov, Reuters, Bloomberg)
-4. For expert opinions: Prioritize major investment banks and research firms
-5. Categorize expert opinions as BULLISH/BEARISH/NEUTRAL
-
-**CRITICAL**: You MUST search for both official announcements AND expert opinions before writing your analysis.
-
-=== News Classification Guide ===
-
-When evaluating news articles, classify them:
-
-**HIGH PRIORITY (Official Announcements - 25% weight):**
-- "Fed announces rate cut" → Official policy
-- "Trump imposes new tariffs on China" → Political decision
-- "U.S. inflation hits 3.2%" → Official data
-
-**MEDIUM PRIORITY (Expert Opinions - 25% weight):**
-Categorize each opinion as BULLISH, BEARISH, or NEUTRAL:
-
-🟢 BULLISH examples:
-- "Goldman Sachs raises S&P 500 target to 6,500" → Bullish
-- "Morgan Stanley recommends overweight equities" → Bullish
-- "JPMorgan sees 15% upside in stocks" → Bullish
-
-🔴 BEARISH examples:
-- "Bank of America warns of 20% correction" → Bearish
-- "Deutsche Bank recommends underweight" → Bearish
-- "Analyst predicts recession in Q2" → Bearish
-
-⚪ NEUTRAL examples:
-- "Citi maintains market-weight rating" → Neutral
-- "UBS sees mixed outlook, recommends hold" → Neutral
-
-**Source Credibility Ranking:**
-1. Major Investment Banks: Goldman Sachs, Morgan Stanley, JPMorgan, Bank of America, Citi, UBS
-2. Research Firms: Morningstar, S&P Global, Moody's
-3. Financial Media Analysts: Bloomberg, Reuters contributors
-4. Independent Analysts: Lower weight within the 25%
-
-=== Analysis Requirements ===
-1. **Multi-Period Indicator Analysis** (PRIMARY - 50%):
-   - For DAILY indicators (US10Y, US2Y, T10Y2Y, DXY, HYS, SPX, IXIC, RUT, OIL, GOLD, Cu/Au, BTC, VIX, MOVE, USDKRW, KOSPI, EWY, KOSDAQ, KR3Y, KR10Y, KRSEMI): Use 1D/7D/30D periods to identify short-term vs long-term trends
-   - For MONTHLY indicators (M2, CPI, PAYEMS, KRTB, MFG): Use 1M/2M/3M periods to identify monthly trends
-   - Compare different timeframes to assess momentum and trend reversals
-   - Analyze cross-indicator relationships (e.g., yields vs dollar, VIX vs equities)
-
-2. **Official News Integration** (SECONDARY - 25%):
-   - Reference official announcements to explain indicator movements
-   - When citing, mention ACTUAL CONTENT and SOURCE, not index numbers
-   - Good example: "연준의 긴축 기조 유지 발언(FOMC 성명서)에 따라 10년물 국채 수익률이 상승..."
-   - Bad example: "뉴스1에 따르면...", "(뉴스2)"
-
-3. **Expert Opinion Synthesis** (TERTIARY - 25%):
-   - MUST search for and report expert opinions from major investment banks
-   - Categorize opinions: Count BULLISH vs BEARISH vs NEUTRAL
-   - Report consensus: "월가 주요 IB 중 X개사 매수, Y개사 매도, Z개사 중립 의견"
-   - Include specific analyst names and price targets when available
-   - Note significant contrarian views from credible sources
-   - Good example: "Goldman Sachs는 S&P 500 목표가를 6,500으로 상향하며 매수 의견을 유지한 반면, Morgan Stanley는 단기 조정 가능성을 경고했습니다."
-
-4. **Balanced Reasoning**:
-   - Start with indicator analysis (50%)
-   - Integrate official announcements (25%)
-   - Synthesize expert consensus with opinion distribution (25%)
-   - All three factors should be reflected in your reasoning
-
-5. **Market Sentiment**: Determine sentiment ("bullish"/"bearish"/"neutral") based on:
-   - Economic indicators (50%)
-   - Official announcements (25%)
-   - Expert consensus direction (25%)
-
-6. **Specific Risks**: Identify 3-4 concrete risks based on indicator trends, official policy, AND contrarian expert views
-
-Respond ONLY with the following JSON format:
+Output requirements (must follow exactly):
+- Return ONLY valid JSON. No markdown, no code block, no extra text.
+- JSON schema:
 {
   "sentiment": "bullish" | "bearish" | "neutral",
-  "reasoning": "5-6 sentences including indicator analysis, official news, AND expert opinion consensus (e.g., 'X bullish, Y bearish, Z neutral')",
-  "risks": ["risk 1", "risk 2", "risk 3"]
+  "reasoning": "Korean 7-9 sentences. Must include: (a) indicator scoreboard counts, (b) 1-3개월 관점, (c) 한국 시장 전이 평가, (d) 신뢰도(높음/중간/낮음)와 근거.",
+  "risks": ["Korean risk item with trigger and impact", "..."]
 }
-
-CRITICAL:
-- The "reasoning" and "risks" fields MUST be written in Korean language
-- You MUST include expert opinion consensus in your reasoning (e.g., "주요 IB 5곳 중 3곳 매수, 1곳 매도, 1곳 중립")
-- When citing sources, mention the actual institution/analyst name (e.g., "Goldman Sachs", "Morgan Stanley"), NOT generic terms`;
+- "risks" must contain 3-5 concrete items.
+- Ensure sentiment is logically consistent with reasoning and risks.`;
 
   try {
     const text = await runGeminiCliPrompt(prompt, modelName);
@@ -812,7 +758,7 @@ CRITICAL:
 }
 
 /**
- * Generate AI comments for multiple indicators in a single API call (2-3 sentences each)
+ * Generate AI comments for multiple indicators in a single API call (3 sentences each)
  *
  * Batch processing:
  * - Takes array of indicators with cache misses
@@ -844,63 +790,35 @@ export async function generateBatchComments(
 
   const symbolList = indicators.map(({ symbol }) => symbol).join(', ');
 
-  const prompt = `You are a financial market analyst. Today is ${dateStr}.
+  const prompt = `Role: You are a buy-side macro analyst writing high-signal Korean dashboard briefs.
+Today: ${dateStr}
 
-Analyze the following ${indicators.length} economic indicators and provide a brief comment for EACH indicator (2-3 sentences in Korean).
+Task:
+- For each indicator below, write one detailed Korean comment with EXACTLY 3 sentences.
+- Goal: maximize accuracy, specificity, and practical decision value.
 
-**Indicators:**
+Indicators:
 ${indicatorDescriptions}
 
-**Search Instructions:**
-- Use Google Search to find the ACTUAL cause of today's indicator movement
-- Search for news from the last 7 days only
-- Prioritize: Fed announcements, economic data releases, geopolitical events
-- If no specific news found, state "명확한 단일 원인 없이 기술적 조정"
+Per-indicator sentence template (strict):
+1) Driver sentence: explain WHY the move happened using concrete evidence (policy/data/event/positioning).
+2) Transmission sentence: explain WHICH assets/sectors/regions are affected and in what direction.
+3) Monitoring sentence: state one 1-2주 핵심 체크포인트 and what it implies if confirmed.
 
-**Analysis Requirements:**
-For EACH indicator, provide a 2-3 sentence analysis in Korean following this structure:
+Evidence policy:
+- Priority: official policy/data releases > market-implied pricing changes > technical/positioning factors.
+- If no verified single catalyst exists, write exactly: "확인 가능한 단일 이벤트보다 포지셔닝/기술적 요인의 영향이 우세합니다."
+- Never start with a simple restatement of current value or % change.
+- Avoid vague phrases without anchor (e.g., 심리 악화, 불확실성 확대).
+- Do not fabricate exact numbers, dates, quotes, or institutions.
 
-**Sentence 1 - Cause & Context (MUST BE SPECIFIC):**
-Directly explain the reason for the change using ONLY concrete evidence. DO NOT start with descriptive statements like "지표가 X% 상승/하락했습니다".
-- ✅ GOOD: "연준 파월 의장의 1월 7일 매파적 발언으로 금리 인상 기대감이 높아졌습니다."
-- ✅ GOOD: "12월 비농업 고용이 30만명으로 예상치 25만명을 상회하며 강한 고용시장을 보였습니다."
-- ✅ GOOD: "ECB의 50bp 금리 인상 결정으로 유로존 긴축 정책이 강화되었습니다."
-- ✅ GOOD: "중동 지역 유가 공급 차질 우려가 확대되며 에너지 가격 상승 압력이 증가했습니다."
-- ❌ BAD: "VIX 지수가 15.12로 전일 대비 4.35% 상승했습니다." (단순 현황 설명)
-- ❌ BAD: "시장 불확실성", "투자자 심리 악화", "리스크 회피 심리" (추상적 표현)
-- ❌ BAD: "경기 둔화 우려", "인플레이션 압력" (일반적 이유)
+JSON output contract (strict):
+- Return ONLY a JSON object and nothing else.
+- Include ALL requested symbols exactly once as top-level keys.
+- Each value must be Korean plain text (no markdown).
+- If evidence is limited, still provide 3-sentence comment using the fallback sentence above.
 
-**Sentence 2 - Market Impact:**
-Explain what this change means for specific markets, sectors, or assets.
-- Example: "이로 인해 성장주 중심의 기술주 섹터에 조정 압력이 가해질 전망입니다."
-- Example: "원자재 수출국 통화와 에너지 섹터가 수혜를 입을 것으로 예상됩니다."
-
-**CRITICAL RULES:**
-- NEVER start with descriptive statements about the indicator's current value or percentage change (e.g., "지표가 X로 Y% 상승했습니다")
-- Start IMMEDIATELY with the causal explanation (WHY it changed)
-- ALWAYS cite SPECIFIC, CONCRETE events or data (with dates/numbers if possible)
-- NEVER use abstract/vague terms like "시장 불안", "투자자 심리", "불확실성 증가"
-- NEVER make unsupported claims - only use verifiable facts
-- If you cannot find specific evidence, state "명확한 단일 원인 없이 기술적 조정" instead of making up reasons
-- Use concrete sector examples (e.g., "반도체", "신흥국 채권", "원자재 수출주")
-- Respond ONLY in valid JSON format
-
-**Evidence Priority:**
-1. Official policy announcements (Fed, ECB, government statements)
-2. Economic data releases (employment, CPI, GDP, etc.)
-3. Corporate earnings/guidance
-4. Geopolitical events with clear market impact
-5. Technical factors (if no fundamental catalyst exists)
-
-**Response Format:**
-{
-  "US10Y": "Korean comment here...",
-  "DXY": "Korean comment here...",
-  "HYS": "Korean comment here...",
-  ...
-}
-
-Generate comments for these symbols: ${symbolList}`;
+Required keys: [${symbolList}]`;
 
   try {
     const text = await runGeminiCliPrompt(prompt, modelName);

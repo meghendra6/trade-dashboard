@@ -13,6 +13,7 @@ import {
   getIndicatorTooltipKo,
 } from '@/lib/constants/chart-tooltips-ko';
 import { parseApiErrorMessage } from '@/lib/utils/api-error-message';
+import HoverTooltip from './HoverTooltip';
 import {
   Bar,
   BarChart,
@@ -135,10 +136,12 @@ function ExpandedIndicatorChart({ entry }: { entry: IndicatorEntry }) {
   return (
     <div className="glass-card rounded-xl p-5">
       <div className="flex items-start justify-between mb-3">
-        <div title={getIndicatorTooltipKo(indicator.symbol, indicator.name)}>
-          <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 cursor-help">
-            {indicator.name}
-          </h3>
+        <div>
+          <HoverTooltip content={getIndicatorTooltipKo(indicator.symbol, indicator.name)}>
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 cursor-help">
+              {indicator.name}
+            </h3>
+          </HoverTooltip>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">{indicator.symbol}</p>
         </div>
         <div className="text-right">
@@ -344,12 +347,14 @@ export default function AdvancedAnalytics({ dashboardData }: AdvancedAnalyticsPr
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
         <div className="glass-card rounded-xl p-5">
-          <h3
-            className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-3 cursor-help"
-            title={ADVANCED_ANALYTICS_CHART_TOOLTIP_KO.periodComparison}
+          <HoverTooltip
+            content={ADVANCED_ANALYTICS_CHART_TOOLTIP_KO.periodComparison}
+            className="mb-3"
           >
-            기간별 변화율 비교
-          </h3>
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 cursor-help">
+              기간별 변화율 비교
+            </h3>
+          </HoverTooltip>
           <div className="h-72 w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={periodComparisonData} margin={{ top: 8, right: 8, left: 0, bottom: 16 }}>
@@ -367,12 +372,14 @@ export default function AdvancedAnalytics({ dashboardData }: AdvancedAnalyticsPr
         </div>
 
         <div className="glass-card rounded-xl p-5">
-          <h3
-            className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-3 cursor-help"
-            title={ADVANCED_ANALYTICS_CHART_TOOLTIP_KO.volatilityTrend}
+          <HoverTooltip
+            content={ADVANCED_ANALYTICS_CHART_TOOLTIP_KO.volatilityTrend}
+            className="mb-3"
           >
-            변동성 & 추세 점수
-          </h3>
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 cursor-help">
+              변동성 & 추세 점수
+            </h3>
+          </HoverTooltip>
           <div className="h-72 w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={volatilityData} margin={{ top: 8, right: 8, left: 0, bottom: 16 }}>

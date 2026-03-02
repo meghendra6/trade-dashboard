@@ -1,6 +1,7 @@
 import { IndicatorData } from '@/lib/types/indicators';
 import MiniChart from './MiniChart';
 import { getIndicatorTooltipKo } from '@/lib/constants/chart-tooltips-ko';
+import HoverTooltip from './HoverTooltip';
 
 interface IndicatorCardProps {
   indicator: IndicatorData;
@@ -44,10 +45,12 @@ export default function IndicatorCard({ indicator, aiComment, isLoadingComments 
     >
       <div className="flex flex-col gap-4 flex-1">
         <div className="flex items-start justify-between">
-          <div title={tooltipDescription}>
-            <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-300 cursor-help">
-              {indicator.name}
-            </h3>
+          <div>
+            <HoverTooltip content={tooltipDescription}>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-300 cursor-help">
+                {indicator.name}
+              </h3>
+            </HoverTooltip>
             <p className="text-xs text-zinc-400 dark:text-zinc-400 mt-1">
               {indicator.symbol}
             </p>
