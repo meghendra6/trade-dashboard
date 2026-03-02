@@ -1,4 +1,5 @@
 import { Redis } from '@upstash/redis';
+import { createHash } from 'node:crypto';
 
 interface RateLimitOptions {
   windowMs: number;
@@ -26,6 +27,7 @@ const BASE_TRUSTED_IP_HEADERS = [
 const SAFE_IP_PATTERN = /^[A-Fa-f0-9:.]{3,64}$/;
 const SAFE_HEADER_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
 const TRUST_PROXY_HEADERS = process.env.RATE_LIMIT_TRUST_PROXY_HEADERS === '1';
+const STRICT_PROXY_MODE = process.env.RATE_LIMIT_STRICT_PROXY_MODE === '1';
 const X_FORWARDED_FOR_HOP = (process.env.RATE_LIMIT_XFF_HOP || 'first').toLowerCase();
 const TRUSTED_PROXY_SIGNATURE = process.env.RATE_LIMIT_PROXY_SIGNATURE || '';
 const TRUSTED_PROXY_SIGNATURE_HEADER = (process.env.RATE_LIMIT_PROXY_SIGNATURE_HEADER || 'x-ingress-signature')
@@ -149,6 +151,20 @@ function toSeconds(milliseconds: number): number {
   return Math.max(1, Math.ceil(milliseconds / 1000));
 }
 
+function getLowTrustClientFingerprint(request: Request): string {
+  const userAgent = (request.headers.get('user-agent') || '').slice(0, 256);
+  const acceptLanguage = (request.headers.get('accept-language') || '').slice(0, 128);
+  const accept = (request.headers.get('accept') || '').slice(0, 128);
+  const source = `${userAgent}|${acceptLanguage}|${accept}`;
+
+  if (!source.replace(/\|/g, '').trim()) {
+    return 'anonymous-low-trust';
+  }
+
+  const digest = createHash('sha256').update(source).digest('hex');
+  return `fp:${digest.slice(0, 24)}`;
+}
+
 async function checkBucketWithRedis(
   key: string,
   limit: number,
@@ -180,10 +196,9 @@ export async function checkRateLimit(
   options: RateLimitOptions
 ): Promise<RateLimitDecision> {
   const windowSeconds = toSeconds(options.windowMs);
-  const isProduction = process.env.NODE_ENV === 'production';
 
-  if (isProduction && !TRUST_PROXY_HEADERS) {
-    console.error('[rate-limit] RATE_LIMIT_TRUST_PROXY_HEADERS must be enabled in production.');
+  if (STRICT_PROXY_MODE && !TRUST_PROXY_HEADERS) {
+    console.error('[rate-limit] STRICT mode requires RATE_LIMIT_TRUST_PROXY_HEADERS=1.');
     return {
       limited: true,
       retryAfterSeconds: windowSeconds,
@@ -192,7 +207,7 @@ export async function checkRateLimit(
   }
 
   const trustedClientIp = getTrustedClientIp(request);
-  if (isProduction && !trustedClientIp) {
+  if (STRICT_PROXY_MODE && !trustedClientIp) {
     return {
       limited: true,
       retryAfterSeconds: windowSeconds,
@@ -200,7 +215,7 @@ export async function checkRateLimit(
     };
   }
 
-  const clientId = trustedClientIp || 'anonymous-low-trust';
+  const clientId = trustedClientIp || getLowTrustClientFingerprint(request);
   const perClientLimit = trustedClientIp ? options.maxPerClient : Math.max(1, Math.floor(options.maxPerClient / 3));
 
   if (redis) {
