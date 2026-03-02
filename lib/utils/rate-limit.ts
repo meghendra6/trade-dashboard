@@ -1,4 +1,5 @@
 import { Redis } from '@upstash/redis';
+import { createHash } from 'node:crypto';
 
 interface RateLimitOptions {
   windowMs: number;
@@ -10,7 +11,7 @@ interface RateLimitOptions {
 interface RateLimitDecision {
   limited: boolean;
   retryAfterSeconds: number;
-  reason: 'client' | 'global';
+  reason: 'client' | 'global' | 'misconfigured';
 }
 
 interface SlidingWindowState {
@@ -18,12 +19,28 @@ interface SlidingWindowState {
 }
 
 const DEFAULT_MAX_TRACKED_KEYS = 5000;
-const TRUSTED_IP_HEADER_CANDIDATES = [
+const BASE_TRUSTED_IP_HEADERS = [
   'x-vercel-forwarded-for',
   'cf-connecting-ip',
   'x-forwarded-for',
 ] as const;
 const SAFE_IP_PATTERN = /^[A-Fa-f0-9:.]{3,64}$/;
+const SAFE_HEADER_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
+const TRUST_PROXY_HEADERS = process.env.RATE_LIMIT_TRUST_PROXY_HEADERS === '1';
+const STRICT_PROXY_MODE = process.env.RATE_LIMIT_STRICT_PROXY_MODE === '1';
+const X_FORWARDED_FOR_HOP = (process.env.RATE_LIMIT_XFF_HOP || 'first').toLowerCase();
+const TRUSTED_PROXY_SIGNATURE = process.env.RATE_LIMIT_PROXY_SIGNATURE || '';
+const TRUSTED_PROXY_SIGNATURE_HEADER = (process.env.RATE_LIMIT_PROXY_SIGNATURE_HEADER || 'x-ingress-signature')
+  .trim()
+  .toLowerCase();
+
+const TRUSTED_IP_HEADER_CANDIDATES = [
+  ...BASE_TRUSTED_IP_HEADERS,
+  ...((process.env.RATE_LIMIT_EXTRA_TRUSTED_IP_HEADERS || '')
+    .split(',')
+    .map((header) => header.trim().toLowerCase())
+    .filter((header) => SAFE_HEADER_NAME_PATTERN.test(header))),
+];
 
 const redis =
   process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
@@ -102,18 +119,50 @@ function normalizeIp(rawValue: string | null | undefined): string | null {
 }
 
 function getTrustedClientIp(request: Request): string {
+  if (!TRUST_PROXY_HEADERS) {
+    return '';
+  }
+  if (TRUSTED_PROXY_SIGNATURE) {
+    const providedSignature = request.headers.get(TRUSTED_PROXY_SIGNATURE_HEADER) || '';
+    if (providedSignature !== TRUSTED_PROXY_SIGNATURE) {
+      return '';
+    }
+  }
+
   for (const header of TRUSTED_IP_HEADER_CANDIDATES) {
     const raw = request.headers.get(header);
     if (!raw) continue;
-    const normalized = normalizeIp(raw);
+    const candidate = header === 'x-forwarded-for'
+      ? (() => {
+          const hops = raw.split(',').map((hop) => hop.trim()).filter(Boolean);
+          if (hops.length === 0) return raw;
+          if (X_FORWARDED_FOR_HOP === 'last') return hops[hops.length - 1];
+          return hops[0];
+        })()
+      : raw;
+    const normalized = normalizeIp(candidate);
     if (normalized) return normalized;
   }
 
-  return 'unknown';
+  return '';
 }
 
 function toSeconds(milliseconds: number): number {
   return Math.max(1, Math.ceil(milliseconds / 1000));
+}
+
+function getLowTrustClientFingerprint(request: Request): string {
+  const userAgent = (request.headers.get('user-agent') || '').slice(0, 256);
+  const acceptLanguage = (request.headers.get('accept-language') || '').slice(0, 128);
+  const accept = (request.headers.get('accept') || '').slice(0, 128);
+  const source = `${userAgent}|${acceptLanguage}|${accept}`;
+
+  if (!source.replace(/\|/g, '').trim()) {
+    return 'anonymous-low-trust';
+  }
+
+  const digest = createHash('sha256').update(source).digest('hex');
+  return `fp:${digest.slice(0, 24)}`;
 }
 
 async function checkBucketWithRedis(
@@ -147,13 +196,33 @@ export async function checkRateLimit(
   options: RateLimitOptions
 ): Promise<RateLimitDecision> {
   const windowSeconds = toSeconds(options.windowMs);
-  const clientIp = getTrustedClientIp(request);
+
+  if (STRICT_PROXY_MODE && !TRUST_PROXY_HEADERS) {
+    console.error('[rate-limit] STRICT mode requires RATE_LIMIT_TRUST_PROXY_HEADERS=1.');
+    return {
+      limited: true,
+      retryAfterSeconds: windowSeconds,
+      reason: 'misconfigured',
+    };
+  }
+
+  const trustedClientIp = getTrustedClientIp(request);
+  if (STRICT_PROXY_MODE && !trustedClientIp) {
+    return {
+      limited: true,
+      retryAfterSeconds: windowSeconds,
+      reason: 'misconfigured',
+    };
+  }
+
+  const clientId = trustedClientIp || getLowTrustClientFingerprint(request);
+  const perClientLimit = trustedClientIp ? options.maxPerClient : Math.max(1, Math.floor(options.maxPerClient / 3));
 
   if (redis) {
     try {
       const clientResult = await checkBucketWithRedis(
-        `ratelimit:${scope}:client:${clientIp}`,
-        options.maxPerClient,
+        `ratelimit:${scope}:client:${clientId}`,
+        perClientLimit,
         windowSeconds
       );
       if (!clientResult.allowed) {
@@ -180,7 +249,7 @@ export async function checkRateLimit(
       return {
         limited: false,
         retryAfterSeconds: 0,
-        reason: 'client',
+        reason: 'global',
       };
     } catch (error) {
       console.error('[rate-limit] Redis limiter failed, falling back to in-memory limiter:', error);
@@ -191,8 +260,8 @@ export async function checkRateLimit(
   const limiter = getLimiter(maxTrackedKeys);
   const nowMs = Date.now();
 
-  const clientKey = `${scope}:client:${clientIp}`;
-  const clientResult = limiter.check(clientKey, options.maxPerClient, options.windowMs, nowMs);
+  const clientKey = `${scope}:client:${clientId}`;
+  const clientResult = limiter.check(clientKey, perClientLimit, options.windowMs, nowMs);
   if (!clientResult.allowed) {
     return {
       limited: true,
@@ -218,6 +287,6 @@ export async function checkRateLimit(
   return {
     limited: false,
     retryAfterSeconds: 0,
-    reason: 'client',
+    reason: 'global',
   };
 }

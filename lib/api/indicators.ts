@@ -1,9 +1,17 @@
-import { IndicatorData, FREDResponse, YahooFinanceQuote, HistoricalDataPoint, CoinGeckoSimplePrice, CoinGeckoMarketChart } from '../types/indicators';
+import { DashboardData, IndicatorData, FREDResponse, YahooFinanceQuote, HistoricalDataPoint, CoinGeckoSimplePrice, CoinGeckoMarketChart } from '../types/indicators';
 import { indicatorCommentCache } from '../cache/indicator-comment-cache';
 import { generateBatchComments } from './gemini';
 
 const FRED_API_KEY = process.env.FRED_API_KEY;
 const FRED_BASE_URL = 'https://api.stlouisfed.org/fred/series/observations';
+const lastKnownIndicators: Partial<DashboardData['indicators']> = {};
+
+function calculateChangePercent(change: number, pastValue: number): number | undefined {
+  if (!Number.isFinite(change) || !Number.isFinite(pastValue) || pastValue === 0) {
+    return undefined;
+  }
+  return (change / Math.abs(pastValue)) * 100;
+}
 
 /**
  * Calculate change and change percentage for a given period (entry-based)
@@ -38,9 +46,7 @@ function calculatePeriodChange(
 
   const pastValue = pastDataPoint.value;
   const change = current - pastValue;
-  // Use absolute value of pastValue to ensure changePercent has correct sign
-  // when dealing with negative values (e.g., Manufacturing Confidence)
-  const changePercent = (change / Math.abs(pastValue)) * 100;
+  const changePercent = calculateChangePercent(change, pastValue);
 
   return { change, changePercent };
 }
@@ -91,7 +97,7 @@ function calculateCalendarDayChange(
 
   const pastValue = closestPoint.value;
   const change = current - pastValue;
-  const changePercent = (change / Math.abs(pastValue)) * 100;
+  const changePercent = calculateChangePercent(change, pastValue);
 
   return { change, changePercent };
 }
@@ -116,16 +122,21 @@ async function fetchFREDData(seriesId: string, limit: number = 40): Promise<{ cu
     throw new Error('Insufficient data from FRED API');
   }
 
-  const current = parseFloat(data.observations[0].value);
-  const previous = parseFloat(data.observations[1].value);
-
-  const history: HistoricalDataPoint[] = data.observations
-    .reverse()
-    .filter(obs => obs.value !== '.')
-    .map(obs => ({
+  const observations = data.observations
+    .filter((obs) => obs.value !== '.')
+    .map((obs) => ({
       date: obs.date,
-      value: parseFloat(obs.value),
-    }));
+      value: Number.parseFloat(obs.value),
+    }))
+    .filter((obs) => Number.isFinite(obs.value));
+
+  if (observations.length < 2) {
+    throw new Error('Insufficient valid data from FRED API');
+  }
+
+  const current = observations[0].value;
+  const previous = observations[1].value;
+  const history: HistoricalDataPoint[] = observations.slice().reverse();
 
   return { current, previous, history };
 }
@@ -1320,91 +1331,62 @@ export async function generateAIComments(indicators: {
 export async function getAllIndicators() {
   console.log('[getAllIndicators] Phase 1: Fetching indicator data...');
 
-  // Phase 1: Fetch all indicator data in parallel (no AI comments)
-  const [
-    us10yYield,
-    us2yYield,
-    yieldCurveSpread, // NEW: 10Y-2Y spread
-    dxy,
-    highYieldSpread,
-    m2MoneySupply,
-    cpi,             // NEW: Consumer Price Index
-    payems,          // NEW: Total Nonfarm Employment (PAYEMS)
-    sp500,           // NEW: S&P 500 Index
-    nasdaq,          // NEW: Nasdaq Composite
-    russell2000,     // NEW: Russell 2000 Index
-    crudeOil,
-    gold,            // NEW: Gold Futures
-    moveIndex,       // NEW: MOVE Index
-    copperGoldRatio,
-    pmi,
-    putCallRatio,
-    bitcoin,
-    usdKrw,          // NEW: USD/KRW exchange rate
-    kospi,           // NEW: KOSPI Index
-    ewy,             // NEW: iShares MSCI Korea ETF
-    kosdaq,          // NEW: KOSDAQ Index
-    kr3yBond,        // NEW: KR 3Y Treasury proxy
-    kr10yBond,       // NEW: KR 10Y Treasury proxy
-    koreaSemiconductorExportsProxy, // NEW: Korea semiconductor exports proxy
-    koreaTradeBalance, // NEW: Korea trade balance (monthly)
-  ] = await Promise.all([
-    getUS10YYield(),
-    getUS2YYield(),
-    getYieldCurveSpread(),        // NEW
-    getDXY(),
-    getHighYieldSpread(),
-    getM2MoneySupply(),
-    getCPI(),                    // NEW
-    getNFP(),                    // NEW
-    getSP500(),                  // NEW
-    getNasdaq(),                 // NEW
-    getRussell2000(),            // NEW
-    getCrudeOil(),
-    getGold(),                   // NEW
-    getMOVEIndex(),              // NEW
-    getCopperGoldRatio(),
-    getPMI(),
-    getPutCallRatio(),
-    getBitcoin(),
-    getUSDKRW(),                 // NEW
-    getKospi(),                  // NEW
-    getEWY(),                    // NEW
-    getKosdaq(),                 // NEW
-    getKorea3YBondProxy(),       // NEW
-    getKorea10YBondProxy(),      // NEW
-    getKoreaSemiconductorExportsProxy(), // NEW
-    getKoreaTradeBalance(),      // NEW
-  ]);
+  type IndicatorKey = keyof DashboardData['indicators'];
+  const fetchPlan: Array<{ key: IndicatorKey; loader: () => Promise<IndicatorData> }> = [
+    { key: 'us10yYield', loader: getUS10YYield },
+    { key: 'us2yYield', loader: getUS2YYield },
+    { key: 'yieldCurveSpread', loader: getYieldCurveSpread },
+    { key: 'dxy', loader: getDXY },
+    { key: 'highYieldSpread', loader: getHighYieldSpread },
+    { key: 'm2MoneySupply', loader: getM2MoneySupply },
+    { key: 'cpi', loader: getCPI },
+    { key: 'payems', loader: getNFP },
+    { key: 'sp500', loader: getSP500 },
+    { key: 'nasdaq', loader: getNasdaq },
+    { key: 'russell2000', loader: getRussell2000 },
+    { key: 'crudeOil', loader: getCrudeOil },
+    { key: 'gold', loader: getGold },
+    { key: 'moveIndex', loader: getMOVEIndex },
+    { key: 'copperGoldRatio', loader: getCopperGoldRatio },
+    { key: 'pmi', loader: getPMI },
+    { key: 'putCallRatio', loader: getPutCallRatio },
+    { key: 'bitcoin', loader: getBitcoin },
+    { key: 'usdKrw', loader: getUSDKRW },
+    { key: 'kospi', loader: getKospi },
+    { key: 'ewy', loader: getEWY },
+    { key: 'kosdaq', loader: getKosdaq },
+    { key: 'kr3yBond', loader: getKorea3YBondProxy },
+    { key: 'kr10yBond', loader: getKorea10YBondProxy },
+    { key: 'koreaSemiconductorExportsProxy', loader: getKoreaSemiconductorExportsProxy },
+    { key: 'koreaTradeBalance', loader: getKoreaTradeBalance },
+  ];
 
-  const indicators = {
-    us10yYield,
-    us2yYield,
-    yieldCurveSpread, // NEW
-    dxy,
-    highYieldSpread,
-    m2MoneySupply,
-    cpi,             // NEW
-    payems,          // NEW
-    sp500,           // NEW
-    nasdaq,          // NEW
-    russell2000,     // NEW
-    crudeOil,
-    gold,            // NEW
-    moveIndex,       // NEW
-    copperGoldRatio,
-    pmi,
-    putCallRatio,
-    bitcoin,
-    usdKrw,          // NEW
-    kospi,           // NEW
-    ewy,             // NEW
-    kosdaq,          // NEW
-    kr3yBond,        // NEW
-    kr10yBond,       // NEW
-    koreaSemiconductorExportsProxy, // NEW
-    koreaTradeBalance, // NEW
-  };
+  const settledResults = await Promise.allSettled(fetchPlan.map((entry) => entry.loader()));
+  const indicators = {} as DashboardData['indicators'];
+  const missingKeys: IndicatorKey[] = [];
+
+  settledResults.forEach((result, index) => {
+    const key = fetchPlan[index].key;
+    if (result.status === 'fulfilled') {
+      indicators[key] = result.value;
+      lastKnownIndicators[key] = result.value;
+      return;
+    }
+
+    const fallback = lastKnownIndicators[key];
+    if (fallback) {
+      indicators[key] = fallback;
+      console.warn(`[getAllIndicators] Using last-known fallback for ${key}:`, result.reason);
+      return;
+    }
+
+    missingKeys.push(key);
+    console.error(`[getAllIndicators] Failed to fetch ${key} with no fallback:`, result.reason);
+  });
+
+  if (missingKeys.length > 0) {
+    throw new Error(`Failed to fetch required indicators: ${missingKeys.join(', ')}`);
+  }
 
   console.log(`[getAllIndicators] Completed with ${Object.keys(indicators).length} indicators`);
 

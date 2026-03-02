@@ -78,14 +78,17 @@ export async function POST(request: Request) {
     maxGlobal: RATE_LIMIT_MAX_GLOBAL,
   });
   if (rateLimitDecision.limited) {
+    const isMisconfigured = rateLimitDecision.reason === 'misconfigured';
     return NextResponse.json(
       {
-        error: 'rate_limited',
-        message: rateLimitDecision.reason === 'global'
+        error: isMisconfigured ? 'server_misconfigured' : 'rate_limited',
+        message: isMisconfigured
+          ? '서버 레이트리밋 설정이 올바르지 않습니다. 관리자에게 문의해주세요.'
+          : rateLimitDecision.reason === 'global'
           ? '현재 요청이 집중되어 있습니다. 잠시 후 다시 시도해주세요.'
           : '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
       },
-      { status: 429, headers: { 'Retry-After': String(rateLimitDecision.retryAfterSeconds) } }
+      { status: isMisconfigured ? 503 : 429, headers: { 'Retry-After': String(rateLimitDecision.retryAfterSeconds) } }
     );
   }
 
@@ -98,7 +101,21 @@ export async function POST(request: Request) {
       );
     }
 
-    const body = JSON.parse(rawBody);
+    let body: unknown;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json(
+        { error: 'Invalid JSON request body' },
+        { status: 400 }
+      );
+    }
+    if (!body || typeof body !== 'object' || !('indicators' in body)) {
+      return NextResponse.json(
+        { error: 'Invalid indicators request body' },
+        { status: 400 }
+      );
+    }
     const { indicators } = body as { indicators: DashboardData['indicators'] };
 
     const sanitizedIndicators = sanitizeIndicators(indicators);

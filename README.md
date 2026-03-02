@@ -64,7 +64,22 @@ GEMINI_CLI_TIMEOUT_MS=180000
 GEMINI_CLI_MAX_CONCURRENCY=2
 GEMINI_CLI_MAX_QUEUE_DEPTH=50
 GEMINI_CLI_ALLOWED_TOOLS=google_web_search
+
+# Rate limit mode A: 프록시 없이 직접 접속(간단)
+RATE_LIMIT_TRUST_PROXY_HEADERS=0
+RATE_LIMIT_STRICT_PROXY_MODE=0
+
+# Rate limit mode B: 프록시/인그레스 사용(권장)
+# RATE_LIMIT_TRUST_PROXY_HEADERS=1
+# RATE_LIMIT_STRICT_PROXY_MODE=1
+# RATE_LIMIT_EXTRA_TRUSTED_IP_HEADERS=x-real-ip
+# RATE_LIMIT_XFF_HOP=first
+# RATE_LIMIT_PROXY_SIGNATURE_HEADER=x-ingress-signature
+# RATE_LIMIT_PROXY_SIGNATURE=shared_secret_value
 ```
+
+프록시를 모르면 `mode A`로 시작해도 됩니다.
+보안 강도를 높이려면 프록시를 붙이고 `mode B`를 사용하세요.
 
 ### 4. 실행
 
