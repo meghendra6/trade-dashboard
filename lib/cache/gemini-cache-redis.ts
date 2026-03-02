@@ -12,20 +12,82 @@ interface CachedPrediction {
 interface ParsedHash {
   model: string;
   us10y: number;
+  us2y: number;
+  t10y2y: number;
   dxy: number;
   spread: number;
   m2: number;
+  spx: number;
+  rut: number;
   oil: number;
+  move: number;
   ratio: number;
   pmi: number;
   vix: number;
   btc: number;
+  usdkrw: number;
+  kospi: number;
+  kosdaq: number;
+  kr3y: number;
+  kr10y: number;
+  krsemi: number;
+  krtb: number;
   [key: string]: string | number; // Allow dynamic indexing
 }
 
 const CACHE_PREFIX = 'gemini:prediction:';
+const PREDICTION_INDEX_KEY = 'gemini:prediction:index';
 const FALLBACK_PREFIX = 'gemini:fallback:';
+const FALLBACK_INDEX_KEY = 'gemini:fallback:index';
 const TTL_SECONDS = 24 * 60 * 60; // 24 hours
+const MAX_FALLBACK_ENTRIES = 50;
+const SIMILARITY_KEYS = [
+  'us10y',
+  'us2y',
+  't10y2y',
+  'dxy',
+  'spread',
+  'm2',
+  'spx',
+  'rut',
+  'oil',
+  'move',
+  'ratio',
+  'pmi',
+  'vix',
+  'btc',
+  'usdkrw',
+  'kospi',
+  'kosdaq',
+  'kr3y',
+  'kr10y',
+  'krsemi',
+  'krtb',
+] as const;
+
+const MIN_THRESHOLDS: Record<(typeof SIMILARITY_KEYS)[number], number> = {
+  us10y: 0.16,
+  us2y: 0.16,
+  t10y2y: 0.25,
+  dxy: 1.0,
+  spread: 0.2,
+  m2: 100,
+  spx: 40,
+  rut: 25,
+  oil: 1.5,
+  move: 1.0,
+  ratio: 0.05,
+  pmi: 0.15,
+  vix: 0.9,
+  btc: 1000,
+  usdkrw: 5,
+  kospi: 20,
+  kosdaq: 10,
+  kr3y: 1,
+  kr10y: 1,
+  krsemi: 1,
+  krtb: 0.1,
+};
 
 /**
  * Upstash Redis-based Gemini cache
@@ -91,14 +153,17 @@ class GeminiCacheRedis {
     try {
       // Store with hash key (for exact match)
       await this.redis.set(key, cached, { ex: TTL_SECONDS });
+      await this.redis.lpush(PREDICTION_INDEX_KEY, key);
+      await this.redis.ltrim(PREDICTION_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
+      await this.redis.expire(PREDICTION_INDEX_KEY, TTL_SECONDS);
 
       // Also store with timestamp key (for fallback retrieval)
       await this.redis.set(fallbackKey, cached, { ex: TTL_SECONDS });
+      await this.redis.lpush(FALLBACK_INDEX_KEY, fallbackKey);
+      await this.redis.ltrim(FALLBACK_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
+      await this.redis.expire(FALLBACK_INDEX_KEY, TTL_SECONDS);
 
       console.log(`[GeminiCacheRedis] Cached prediction: ${hash}`);
-
-      // Cleanup old fallback keys (keep last 10)
-      await this.cleanupFallbackKeys();
     } catch (error) {
       console.error('[GeminiCacheRedis] Error setting prediction:', error);
     }
@@ -107,20 +172,40 @@ class GeminiCacheRedis {
   /**
    * Parse hash string back to numeric values
    */
-  private parseHash(hash: string): ParsedHash {
+  private parseHash(hash: string): ParsedHash | null {
     const parsed = JSON.parse(hash);
-    return {
+    const parsedHash: ParsedHash = {
       model: parsed.model || DEFAULT_GEMINI_MODEL,
       us10y: parseFloat(parsed.us10y),
+      us2y: parseFloat(parsed.us2y),
+      t10y2y: parseFloat(parsed.t10y2y),
       dxy: parseFloat(parsed.dxy),
       spread: parseFloat(parsed.spread),
       m2: parseFloat(parsed.m2),
+      spx: parseFloat(parsed.spx),
+      rut: parseFloat(parsed.rut),
       oil: parseFloat(parsed.oil),
+      move: parseFloat(parsed.move),
       ratio: parseFloat(parsed.ratio),
       pmi: parseFloat(parsed.pmi),
       vix: parseFloat(parsed.vix),
       btc: parseFloat(parsed.btc),
+      usdkrw: parseFloat(parsed.usdkrw),
+      kospi: parseFloat(parsed.kospi),
+      kosdaq: parseFloat(parsed.kosdaq),
+      kr3y: parseFloat(parsed.kr3y),
+      kr10y: parseFloat(parsed.kr10y),
+      krsemi: parseFloat(parsed.krsemi),
+      krtb: parseFloat(parsed.krtb),
     };
+
+    for (const key of SIMILARITY_KEYS) {
+      if (!Number.isFinite(parsedHash[key] as number)) {
+        return null;
+      }
+    }
+
+    return parsedHash;
   }
 
   /**
@@ -131,13 +216,20 @@ class GeminiCacheRedis {
     allCachedPredictions: CachedPrediction[]
   ): Record<string, number> {
     // Parse all cached hashes to numeric values
-    const allValues = allCachedPredictions.map(p => this.parseHash(p.dataHash));
+    const allValues = allCachedPredictions
+      .map((prediction) => this.parseHash(prediction.dataHash))
+      .filter((value): value is ParsedHash => value !== null);
 
-    const keys = ['us10y', 'dxy', 'spread', 'm2', 'oil', 'ratio', 'pmi', 'vix', 'btc'];
     const ranges: Record<string, number> = {};
+    if (allValues.length === 0) {
+      for (const key of SIMILARITY_KEYS) {
+        ranges[key] = 0;
+      }
+      return ranges;
+    }
 
     // Calculate min-max range for each indicator
-    for (const key of keys) {
+    for (const key of SIMILARITY_KEYS) {
       const values = allValues.map(v => v[key] as number);
       const min = Math.min(...values);
       const max = Math.max(...values);
@@ -165,29 +257,17 @@ class GeminiCacheRedis {
   ): number {
     const current = this.parseHash(this.hashData(currentData, modelName));
     const cached = this.parseHash(cachedHash);
-
-    // Minimum thresholds: 1% of historical range (safety net to prevent division by zero)
-    const minThresholds: Record<string, number> = {
-      us10y: 0.16,    // 16 * 0.01
-      dxy: 1.0,       // 100 * 0.01
-      spread: 25,     // 2500 * 0.01
-      m2: 100,        // 10000 * 0.01
-      oil: 1.5,       // 150 * 0.01
-      ratio: 0.05,    // 5 * 0.01
-      pmi: 0.15,      // 15 * 0.01
-      vix: 0.9,       // 90 * 0.01
-      btc: 1000,      // 100000 * 0.01
-    };
+    if (!current || !cached) {
+      return 0;
+    }
 
     let sumSquaredDiffs = 0;
-    const keys = Object.keys(minThresholds);
-
-    for (const key of keys) {
+    for (const key of SIMILARITY_KEYS) {
       // Effective range: max(dynamic range, minimum threshold)
       // Uses dynamic range when cache data varies, falls back to threshold for stability
       const effectiveRange = Math.max(
         dynamicRanges[key] || 0,
-        minThresholds[key]
+        MIN_THRESHOLDS[key]
       );
 
       const diff = Math.abs((current[key] as number) - (cached[key] as number)) / effectiveRange;
@@ -195,7 +275,7 @@ class GeminiCacheRedis {
     }
 
     // Average distance across all dimensions
-    const distance = Math.sqrt(sumSquaredDiffs / keys.length);
+    const distance = Math.sqrt(sumSquaredDiffs / SIMILARITY_KEYS.length);
 
     // Convert distance to similarity score (0-1, where 1 is most similar)
     // Using exponential decay: e^(-distance)
@@ -214,6 +294,34 @@ class GeminiCacheRedis {
     return Math.max(0, 1 - (ageHours / maxAgeHours));
   }
 
+  private async getIndexedFallbackKeys(): Promise<string[]> {
+    const indexedKeys = await this.redis.lrange<string>(FALLBACK_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
+    const filteredIndexedKeys = indexedKeys.filter((key) => key.startsWith(FALLBACK_PREFIX));
+    if (filteredIndexedKeys.length > 0) {
+      return filteredIndexedKeys;
+    }
+
+    const legacyKeys = await this.redis.keys(`${FALLBACK_PREFIX}*`);
+    if (legacyKeys.length === 0) {
+      return [];
+    }
+
+    const sortedLegacyKeys = legacyKeys.sort((a, b) => {
+      const tsA = Number.parseInt(a.replace(FALLBACK_PREFIX, ''), 10);
+      const tsB = Number.parseInt(b.replace(FALLBACK_PREFIX, ''), 10);
+      return tsB - tsA;
+    });
+    const limitedLegacyKeys = sortedLegacyKeys.slice(0, MAX_FALLBACK_ENTRIES);
+
+    await this.redis.del(FALLBACK_INDEX_KEY);
+    for (let i = limitedLegacyKeys.length - 1; i >= 0; i--) {
+      await this.redis.lpush(FALLBACK_INDEX_KEY, limitedLegacyKeys[i]);
+    }
+    await this.redis.expire(FALLBACK_INDEX_KEY, TTL_SECONDS);
+
+    return limitedLegacyKeys;
+  }
+
   /**
    * Get best matching prediction based on similarity to current data
    * Uses Hybrid Min-Max approach: dynamic ranges + minimum thresholds
@@ -224,7 +332,7 @@ class GeminiCacheRedis {
     modelName: string
   ): Promise<MarketPrediction | null> {
     try {
-      const keys = await this.redis.keys(`${FALLBACK_PREFIX}*`);
+      const keys = await this.getIndexedFallbackKeys();
 
       if (keys.length === 0) {
         console.log('[GeminiCacheRedis] No fallback predictions available');
@@ -243,7 +351,9 @@ class GeminiCacheRedis {
       const validPairs = keyPredictionPairs.filter(
         (pair): pair is { key: string; cached: CachedPrediction } => {
           if (pair.cached === null) return false;
-          const cachedModel = this.parseHash(pair.cached.dataHash).model;
+          const parsedHash = this.parseHash(pair.cached.dataHash);
+          if (!parsedHash) return false;
+          const cachedModel = parsedHash.model;
           return cachedModel === modelName;
         }
       );
@@ -307,32 +417,25 @@ class GeminiCacheRedis {
    */
   async getLatestValidPrediction(): Promise<MarketPrediction | null> {
     try {
-      // Get all fallback keys
-      const keys = await this.redis.keys(`${FALLBACK_PREFIX}*`);
+      const keys = await this.getIndexedFallbackKeys();
 
       if (keys.length === 0) {
         console.log('[GeminiCacheRedis] No fallback predictions available');
         return null;
       }
 
-      // Sort by timestamp (newest first)
-      const sortedKeys = keys.sort((a, b) => {
-        const tsA = parseInt(a.replace(FALLBACK_PREFIX, ''));
-        const tsB = parseInt(b.replace(FALLBACK_PREFIX, ''));
-        return tsB - tsA;
-      });
+      for (const key of keys) {
+        const cached = await this.redis.get<CachedPrediction>(key);
+        if (!cached) {
+          continue;
+        }
 
-      // Get the most recent one
-      const latestKey = sortedKeys[0];
-      const cached = await this.redis.get<CachedPrediction>(latestKey);
-
-      if (!cached) {
-        return null;
+        const age = Math.round((Date.now() - cached.timestamp) / 1000);
+        console.log(`[GeminiCacheRedis] Fallback found: ${cached.dataHash} (age: ${age}s)`);
+        return cached.prediction;
       }
 
-      const age = Math.round((Date.now() - cached.timestamp) / 1000);
-      console.log(`[GeminiCacheRedis] Fallback found: ${cached.dataHash} (age: ${age}s)`);
-      return cached.prediction;
+      return null;
     } catch (error) {
       console.error('[GeminiCacheRedis] Error getting fallback:', error);
       return null;
@@ -372,41 +475,12 @@ class GeminiCacheRedis {
   }
 
   /**
-   * Cleanup old fallback keys (keep last 10)
-   */
-  private async cleanupFallbackKeys(): Promise<void> {
-    try {
-      const keys = await this.redis.keys(`${FALLBACK_PREFIX}*`);
-
-      if (keys.length <= 10) {
-        return;
-      }
-
-      // Sort by timestamp (oldest first)
-      const sortedKeys = keys.sort((a, b) => {
-        const tsA = parseInt(a.replace(FALLBACK_PREFIX, ''));
-        const tsB = parseInt(b.replace(FALLBACK_PREFIX, ''));
-        return tsA - tsB;
-      });
-
-      // Delete oldest entries
-      const toDelete = sortedKeys.slice(0, keys.length - 10);
-      if (toDelete.length > 0) {
-        await this.redis.del(...toDelete);
-        console.log(`[GeminiCacheRedis] Cleaned up ${toDelete.length} old fallback keys`);
-      }
-    } catch (error) {
-      console.error('[GeminiCacheRedis] Error cleaning up:', error);
-    }
-  }
-
-  /**
    * Get cache statistics
    */
   async getStats(): Promise<{ predictionKeys: number; fallbackKeys: number }> {
     try {
-      const predictionKeys = await this.redis.keys(`${CACHE_PREFIX}*`);
-      const fallbackKeys = await this.redis.keys(`${FALLBACK_PREFIX}*`);
+      const predictionKeys = await this.redis.lrange<string>(PREDICTION_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
+      const fallbackKeys = await this.getIndexedFallbackKeys();
 
       return {
         predictionKeys: predictionKeys.length,
@@ -423,7 +497,19 @@ class GeminiCacheRedis {
    */
   async clear(): Promise<void> {
     try {
-      const allKeys = await this.redis.keys('gemini:*');
+      const predictionKeys = await this.redis.lrange<string>(PREDICTION_INDEX_KEY, 0, MAX_FALLBACK_ENTRIES - 1);
+      const fallbackKeys = await this.getIndexedFallbackKeys();
+      const legacyKeys = await this.redis.keys('gemini:*');
+      const allKeys = Array.from(
+        new Set([
+          ...predictionKeys,
+          ...fallbackKeys,
+          ...legacyKeys,
+          PREDICTION_INDEX_KEY,
+          FALLBACK_INDEX_KEY,
+        ])
+      );
+
       if (allKeys.length > 0) {
         await this.redis.del(...allKeys);
         console.log(`[GeminiCacheRedis] Cleared ${allKeys.length} keys`);

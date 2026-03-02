@@ -8,6 +8,7 @@ const redis = new Redis({
 
 const COMMENT_PREFIX = 'indicator:comment:';
 const FALLBACK_PREFIX = 'indicator:comment:fallback:';
+const FALLBACK_INDEX_PREFIX = 'indicator:comment:fallback:index:';
 
 interface CachedComment {
   comment: string;
@@ -44,6 +45,7 @@ interface CachedComment {
  */
 class IndicatorCommentCache {
   private readonly TTL = 90000; // 25 hours in seconds
+  private readonly MAX_FALLBACK_ENTRIES = 5;
 
   /**
    * Round indicator value based on symbol for cache key (5x more aggressive)
@@ -111,6 +113,10 @@ class IndicatorCommentCache {
     return `${FALLBACK_PREFIX}${symbol}:${Date.now()}`;
   }
 
+  private getFallbackIndexKey(symbol: string): string {
+    return `${FALLBACK_INDEX_PREFIX}${symbol}`;
+  }
+
   /**
    * Get cached AI comment for indicator
    */
@@ -150,11 +156,12 @@ class IndicatorCommentCache {
 
       // Also store with timestamp key (for fallback retrieval)
       await redis.set(fallbackKey, cached, { ex: this.TTL });
+      const fallbackIndexKey = this.getFallbackIndexKey(symbol);
+      await redis.lpush(fallbackIndexKey, fallbackKey);
+      await redis.ltrim(fallbackIndexKey, 0, this.MAX_FALLBACK_ENTRIES - 1);
+      await redis.expire(fallbackIndexKey, this.TTL);
 
       console.log(`[IndicatorCommentCache] Cached: ${key}`);
-
-      // Cleanup old fallback keys (keep last 5 per symbol)
-      await this.cleanupFallbackKeys(symbol);
     } catch (error) {
       console.error('[IndicatorCommentCache] Error setting cache:', error);
     }
@@ -165,68 +172,49 @@ class IndicatorCommentCache {
    */
   async getLatestComment(symbol: string): Promise<string | null> {
     try {
-      // Get all fallback keys for this symbol
-      const pattern = `${FALLBACK_PREFIX}${symbol}:*`;
-      const keys = await redis.keys(pattern);
+      const fallbackIndexKey = this.getFallbackIndexKey(symbol);
+      let keys = await redis.lrange<string>(fallbackIndexKey, 0, this.MAX_FALLBACK_ENTRIES - 1);
+
+      if (keys.length === 0) {
+        const legacyKeys = await redis.keys(`${FALLBACK_PREFIX}${symbol}:*`);
+        if (legacyKeys.length > 0) {
+          const sortedLegacyKeys = legacyKeys.sort((a, b) => {
+            const tsA = Number.parseInt(a.split(':').pop() || '0', 10);
+            const tsB = Number.parseInt(b.split(':').pop() || '0', 10);
+            return tsB - tsA;
+          });
+          keys = sortedLegacyKeys.slice(0, this.MAX_FALLBACK_ENTRIES);
+
+          await redis.del(fallbackIndexKey);
+          for (let i = keys.length - 1; i >= 0; i--) {
+            await redis.lpush(fallbackIndexKey, keys[i]);
+          }
+          await redis.expire(fallbackIndexKey, this.TTL);
+        }
+      }
 
       if (keys.length === 0) {
         console.log(`[IndicatorCommentCache] No fallback available for ${symbol}`);
         return null;
       }
 
-      // Sort by timestamp (newest first)
-      const sortedKeys = keys.sort((a, b) => {
-        const tsA = parseInt(a.split(':').pop() || '0');
-        const tsB = parseInt(b.split(':').pop() || '0');
-        return tsB - tsA;
-      });
+      for (const fallbackKey of keys) {
+        const cached = await redis.get<CachedComment>(fallbackKey);
+        if (!cached) {
+          continue;
+        }
 
-      // Get the most recent one
-      const latestKey = sortedKeys[0];
-      const cached = await redis.get<CachedComment>(latestKey);
-
-      if (!cached) {
-        return null;
+        const age = Math.round((Date.now() - cached.timestamp) / 1000);
+        console.log(
+          `[IndicatorCommentCache] Fallback found for ${symbol}: value=${cached.value.toFixed(2)}, age=${age}s`
+        );
+        return cached.comment;
       }
 
-      const age = Math.round((Date.now() - cached.timestamp) / 1000);
-      console.log(
-        `[IndicatorCommentCache] Fallback found for ${symbol}: value=${cached.value.toFixed(2)}, age=${age}s`
-      );
-      return cached.comment;
+      return null;
     } catch (error) {
       console.error(`[IndicatorCommentCache] Error getting fallback for ${symbol}:`, error);
       return null;
-    }
-  }
-
-  /**
-   * Cleanup old fallback keys (keep last 5 per symbol)
-   */
-  private async cleanupFallbackKeys(symbol: string): Promise<void> {
-    try {
-      const pattern = `${FALLBACK_PREFIX}${symbol}:*`;
-      const keys = await redis.keys(pattern);
-
-      if (keys.length <= 5) {
-        return;
-      }
-
-      // Sort by timestamp (oldest first)
-      const sortedKeys = keys.sort((a, b) => {
-        const tsA = parseInt(a.split(':').pop() || '0');
-        const tsB = parseInt(b.split(':').pop() || '0');
-        return tsA - tsB;
-      });
-
-      // Delete oldest entries
-      const toDelete = sortedKeys.slice(0, keys.length - 5);
-      if (toDelete.length > 0) {
-        await redis.del(...toDelete);
-        console.log(`[IndicatorCommentCache] Cleaned up ${toDelete.length} old fallback keys for ${symbol}`);
-      }
-    } catch (error) {
-      console.error(`[IndicatorCommentCache] Error cleaning up fallback for ${symbol}:`, error);
     }
   }
 }
