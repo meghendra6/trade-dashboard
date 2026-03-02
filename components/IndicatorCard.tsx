@@ -18,7 +18,7 @@ export default function IndicatorCard({ indicator, aiComment, isLoadingComments 
   };
 
   // Check if this is monthly data (uses 1M/2M/3M periods)
-  const isMonthlyData = ['MFG', 'M2', 'CPI', 'PAYEMS'].includes(indicator.symbol);
+  const isMonthlyData = ['MFG', 'M2', 'CPI', 'PAYEMS', 'KRTB'].includes(indicator.symbol);
 
   // Filter history to show only last N calendar days (not just N entries)
   const getFilteredHistory = (history: typeof indicator.history, days: number) => {

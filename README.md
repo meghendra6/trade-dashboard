@@ -4,22 +4,22 @@
 
 ## 프로젝트 소개
 
-11개의 핵심 경제 지표를 실시간으로 모니터링하고, Google Gemini AI를 활용한 시장 분석을 제공하는 웹 애플리케이션입니다.
+26개의 핵심 경제 지표를 실시간으로 모니터링하고, 로컬 `gemini-cli`를 활용한 시장 분석을 제공하는 웹 애플리케이션입니다.
 
 ## 주요 기능
 
 ### 📊 실시간 지표 모니터링
-- **11개 핵심 지표**: 매크로 경제(6개) + 원자재/자산(3개) + 시장 심리(2개)
+- **26개 핵심 지표**: 매크로 경제(8개) + 주식시장(3개) + 원자재/자산(4개) + 리스크(2개) + 한국 관련(3개) + 한국 특화(5개) + 제조업 심리(1개)
 - **다기간 변화율**: 1D/7D/30D (일별), 1M/2M/3M (월별)
 - **추세 차트**: 30일/12개월 히스토리 시각화
 - **데이터 다운로드**: 지표 데이터 JSON 파일 내보내기
 
 ### 🤖 AI 시장 분석
-- **Google Gemini 2.5 Flash**: 고도화된 프롬프트 엔지니어링 적용
+- **Gemini CLI 연동**: 로컬 인증된 `gemini-cli`로 AI 분석 실행
 - **Google Search 통합**: Fed, 정부 공식 발표 자동 검색
-- **3-Tier 가중치 시스템**: 지표(70%) + 공식발표(25%) + 논평(5%)
+- **3-Tier 가중치 시스템**: 지표(50%) + 공식발표(25%) + 전문가 의견(25%)
 - **💬 지표별 AI 인사이트**: 각 지표의 변화 원인 및 예측 영향 분석 (1-2문장)
-- **모델 선택**: gemini-2.5-flash / gemini-2.5-flash-lite 중 선택
+- **모델 선택**: `gemini-3-flash-preview` / `gemini-3.1-pro-preview` 중 선택
 - **24시간 캐싱**: Upstash Redis 기반 영구 캐시 + Fallback 메커니즘
 
 ### 🎨 기타
@@ -30,7 +30,7 @@
 
 - **Frontend**: Next.js 16.1, React 19.2, TypeScript 5, Tailwind CSS 4, Recharts 3.6
 - **Backend**: Next.js API Routes, Upstash Redis
-- **APIs**: FRED, Yahoo Finance, CoinGecko, Google Gemini
+- **APIs/Tools**: FRED, Yahoo Finance, CoinGecko, Gemini CLI
 
 ## 빠른 시작
 
@@ -42,18 +42,31 @@ cd trade-dashboard
 npm install
 ```
 
-### 2. 환경 변수 설정
+### 2. Gemini CLI 준비
+
+로컬에 `gemini` 명령이 설치되어 있고 로그인된 상태여야 합니다.
+
+```bash
+gemini --version
+```
+
+### 3. 환경 변수 설정
 
 `.env.local` 파일 생성:
 
 ```bash
-GEMINI_API_KEY=your_key         # https://makersuite.google.com/app/apikey
 FRED_API_KEY=your_key           # https://fred.stlouisfed.org/docs/api/api_key.html
 UPSTASH_REDIS_REST_URL=your_url # https://console.upstash.com
 UPSTASH_REDIS_REST_TOKEN=your_token
+# Optional (gemini-cli runtime tuning)
+GEMINI_CLI_PATH=/opt/homebrew/bin/gemini
+GEMINI_CLI_TIMEOUT_MS=180000
+GEMINI_CLI_MAX_CONCURRENCY=2
+GEMINI_CLI_MAX_QUEUE_DEPTH=50
+GEMINI_CLI_ALLOWED_TOOLS=google_web_search
 ```
 
-### 3. 실행
+### 4. 실행
 
 ```bash
 npm run dev  # http://localhost:3000
@@ -63,20 +76,39 @@ npm run dev  # http://localhost:3000
 
 | 카테고리 | 지표 | 출처 | 빈도 |
 |---------|------|------|------|
-| **매크로 (6개)** |
+| **매크로 (8개)** |
 | | US 10Y Yield | FRED | 일별 |
+| | US 2Y Yield | FRED | 일별 |
+| | 10Y-2Y Yield Curve Spread (T10Y2Y) | FRED | 일별 |
 | | US Dollar Index (DXY) | Yahoo Finance | 일별 |
 | | High Yield Spread | FRED | 일별 |
 | | M2 Money Supply | FRED | 월별 |
 | | **Consumer Price Index (CPI)** 🆕 | FRED | 월별 |
 | | **비농업 고용자 수 (Total Nonfarm Employment)** 🆕 | FRED (PAYEMS) | 월별 |
-| **원자재/자산 (3개)** |
+| **주식시장 (3개)** |
+| | S&P 500 Index | Yahoo Finance | 일별 |
+| | Nasdaq Composite | Yahoo Finance | 일별 |
+| | Russell 2000 Index | Yahoo Finance | 일별 |
+| **원자재/자산 (4개)** |
 | | Crude Oil (WTI) | Yahoo Finance | 일별 |
+| | Gold (COMEX Futures) | Yahoo Finance | 일별 |
 | | Copper/Gold Ratio | Yahoo Finance | 일별 |
 | | Bitcoin (BTC/USD) | CoinGecko | 일별 |
-| **시장 심리 (2개)** |
-| | Manufacturing Confidence | FRED | 월별 |
+| **리스크 (2개)** |
 | | VIX (Fear Index) | Yahoo Finance | 일별 |
+| | MOVE Index (Rate Volatility) | Yahoo Finance | 일별 |
+| **한국 관련 (3개)** |
+| | USD/KRW Exchange Rate | Yahoo Finance | 일별 |
+| | KOSPI Composite | Yahoo Finance | 일별 |
+| | iShares MSCI Korea ETF (EWY) | Yahoo Finance | 일별 |
+| **한국 특화 (5개)** |
+| | KOSDAQ Composite | Yahoo Finance | 일별 |
+| | KR 3Y Treasury Proxy (KTB ETF) | Yahoo Finance | 일별 |
+| | KR 10Y Treasury Proxy (KTB ETF) | Yahoo Finance | 일별 |
+| | Korea Semiconductor Exports Proxy (KODEX) | Yahoo Finance | 일별 |
+| | Korea Trade Balance (Commodities) | FRED/OECD | 월별 |
+| **제조업 심리 (1개)** |
+| | Manufacturing Confidence (OECD) | FRED | 월별 |
 
 ## 개발 명령어
 
@@ -107,13 +139,13 @@ trade-dashboard/
 ### AI 프롬프트 엔지니어링
 
 **3-Tier 가중치 시스템**으로 분석 품질 향상:
-- **PRIMARY (70%)**: 9개 지표의 다기간 트렌드 분석
+- **PRIMARY (50%)**: 26개 지표의 다기간 트렌드 분석
 - **SECONDARY (25%)**: Fed/정부 공식 발표 (Google Search 자동 검색)
-- **TERTIARY (5%)**: 애널리스트 의견
+- **TERTIARY (25%)**: 애널리스트 의견
 
 **지표별 AI 인사이트**:
 - 각 지표의 변화 원인과 예측 영향을 1-2문장으로 설명
-- 단일 API 호출로 9개 지표 모두 분석 (추가 비용 없음)
+- 단일 API 호출로 26개 지표 모두 분석 (추가 비용 없음)
 - 한국어로 제공, 차트 하단에 표시
 
 ### 캐싱 전략
@@ -124,4 +156,4 @@ trade-dashboard/
 
 ---
 
-**최종 업데이트**: 2026-01-22
+**최종 업데이트**: 2026-03-02

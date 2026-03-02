@@ -10,6 +10,7 @@ import {
 } from '@/lib/constants/gemini-models';
 
 const STORAGE_KEY = 'gemini-model-preference';
+const STORAGE_MIGRATION_KEY = 'gemini-model-preference-pro-default-migrated';
 
 interface AIPredictionProps {
   dashboardData: DashboardData;
@@ -27,7 +28,18 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
     }
 
     try {
+      const hasMigrated = localStorage.getItem(STORAGE_MIGRATION_KEY) === 'true';
       const savedModel = localStorage.getItem(STORAGE_KEY) as GeminiModelName | null;
+
+      // One-time migration:
+      // when default changed to Pro, reset old persisted preference once.
+      if (!hasMigrated) {
+        localStorage.setItem(STORAGE_MIGRATION_KEY, 'true');
+        localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
+        console.log(`[AIPrediction] Migrated model preference to default: ${DEFAULT_GEMINI_MODEL}`);
+        return DEFAULT_GEMINI_MODEL;
+      }
+
       if (savedModel && GEMINI_MODELS.some(m => m.value === savedModel)) {
         console.log(`[AIPrediction] Loaded model from localStorage: ${savedModel}`);
         return savedModel;

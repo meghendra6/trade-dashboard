@@ -346,14 +346,26 @@ class GeminiCacheRedis {
     const rounded = {
       model: modelName,
       us10y: data.indicators.us10yYield.value.toFixed(2),
+      us2y: data.indicators.us2yYield.value.toFixed(2),
+      t10y2y: data.indicators.yieldCurveSpread.value.toFixed(2),
       dxy: data.indicators.dxy.value.toFixed(1),
       spread: data.indicators.highYieldSpread.value.toFixed(1),
       m2: data.indicators.m2MoneySupply.value.toFixed(0),
+      spx: data.indicators.sp500.value.toFixed(0),
+      rut: data.indicators.russell2000.value.toFixed(0),
       oil: data.indicators.crudeOil.value.toFixed(1),
+      move: data.indicators.moveIndex.value.toFixed(1),
       ratio: data.indicators.copperGoldRatio.value.toFixed(2),
       pmi: data.indicators.pmi.value.toFixed(1),
       vix: data.indicators.putCallRatio.value.toFixed(1),
       btc: (Math.round(data.indicators.bitcoin.value / 500) * 500).toFixed(0),
+      usdkrw: data.indicators.usdKrw.value.toFixed(0),
+      kospi: data.indicators.kospi.value.toFixed(0),
+      kosdaq: data.indicators.kosdaq.value.toFixed(0),
+      kr3y: data.indicators.kr3yBond.value.toFixed(0),
+      kr10y: data.indicators.kr10yBond.value.toFixed(0),
+      krsemi: data.indicators.koreaSemiconductorExportsProxy.value.toFixed(0),
+      krtb: data.indicators.koreaTradeBalance.value.toFixed(1),
     };
 
     return JSON.stringify(rounded);

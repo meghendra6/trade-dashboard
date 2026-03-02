@@ -1,9 +1,44 @@
-import { GoogleGenAI } from '@google/genai';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { DashboardData, IndicatorData } from '../types/indicators';
 import { GeminiModelName, DEFAULT_GEMINI_MODEL } from '../constants/gemini-models';
 import { createQuotaError } from '../types/errors';
 
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+const execFileAsync = promisify(execFile);
+const GEMINI_CLI_COMMAND = process.env.GEMINI_CLI_PATH || 'gemini';
+const GEMINI_CLI_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const QUOTA_ERROR_PATTERNS = ['quota', 'rate limit', '429', 'resource exhausted', 'too many requests'];
+
+function readBoundedIntegerEnv(
+  key: string,
+  defaultValue: number,
+  minValue: number,
+  maxValue: number
+): number {
+  const raw = process.env[key];
+  if (!raw) return defaultValue;
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < minValue || parsed > maxValue) {
+    return defaultValue;
+  }
+
+  return parsed;
+}
+
+const GEMINI_CLI_TIMEOUT_MS = readBoundedIntegerEnv('GEMINI_CLI_TIMEOUT_MS', 360000, 5000, 300000);
+const GEMINI_CLI_MAX_CONCURRENCY = readBoundedIntegerEnv('GEMINI_CLI_MAX_CONCURRENCY', 2, 1, 10);
+const GEMINI_CLI_MAX_QUEUE_DEPTH = readBoundedIntegerEnv('GEMINI_CLI_MAX_QUEUE_DEPTH', 50, 1, 1000);
+const GEMINI_CLI_ALLOWED_TOOLS = (process.env.GEMINI_CLI_ALLOWED_TOOLS || 'google_web_search').trim();
+let activeCliRequests = 0;
+const cliRequestQueue: Array<() => void> = [];
+
+export class GeminiQueueFullError extends Error {
+  constructor() {
+    super('AI request queue is full. Please retry shortly.');
+    this.name = 'GeminiQueueFullError';
+  }
+}
 
 export interface MarketPrediction {
   sentiment: 'bullish' | 'bearish' | 'neutral';
@@ -46,17 +81,316 @@ function formatPeriodChanges(
   return changes.join(', ');
 }
 
-/**
- * Gemini API 응답에서 텍스트 추출
- */
-function extractTextFromOutputs(outputs: Array<{ type?: string; text?: string }> | undefined): string {
-  let text = '';
-  for (const output of outputs || []) {
-    if (output.type === 'text' && output.text) {
-      text += output.text;
+function calculateHistoryVolatility(history: IndicatorData['history']): number | null {
+  if (!history || history.length < 3) {
+    return null;
+  }
+
+  const returns: number[] = [];
+  for (let i = 1; i < history.length; i++) {
+    const prev = history[i - 1].value;
+    const curr = history[i].value;
+    if (prev !== 0) {
+      returns.push(((curr - prev) / Math.abs(prev)) * 100);
     }
   }
-  return text;
+
+  if (returns.length < 2) {
+    return null;
+  }
+
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length;
+  return Math.sqrt(variance);
+}
+
+function getTrendDescriptor(indicator: IndicatorData): string {
+  const short = indicator.changePercent;
+  const mid = indicator.changePercent7d ?? short;
+  const long = indicator.changePercent30d ?? mid;
+
+  if (short > 0 && mid > 0 && long > 0) return 'consistent_uptrend';
+  if (short < 0 && mid < 0 && long < 0) return 'consistent_downtrend';
+  if (short > 0 && long < 0) return 'short_term_rebound';
+  if (short < 0 && long > 0) return 'short_term_pullback';
+  return 'mixed_trend';
+}
+
+function formatRecentHistory(indicator: IndicatorData, points = 5): string {
+  if (!indicator.history || indicator.history.length === 0) {
+    return 'n/a';
+  }
+
+  return indicator.history
+    .slice(-points)
+    .map((point) => {
+      const date = new Date(point.date).toISOString().slice(0, 10);
+      return `${date}:${point.value.toFixed(2)}`;
+    })
+    .join(', ');
+}
+
+function formatAdvancedSignal(indicator: IndicatorData): string {
+  const volatility = calculateHistoryVolatility(indicator.history);
+  const trend = getTrendDescriptor(indicator);
+  const range = indicator.history && indicator.history.length > 0
+    ? Math.max(...indicator.history.map((point) => point.value)) - Math.min(...indicator.history.map((point) => point.value))
+    : null;
+
+  return [
+    `trend=${trend}`,
+    `volatility=${volatility !== null ? `${volatility.toFixed(2)}%` : 'n/a'}`,
+    `range=${range !== null ? range.toFixed(2) : 'n/a'}`,
+    `recent_series=[${formatRecentHistory(indicator)}]`,
+  ].join(', ');
+}
+
+interface GeminiCliError {
+  type?: string;
+  message?: string;
+  code?: string | number;
+}
+
+interface GeminiCliJsonOutput {
+  response?: string;
+  error?: GeminiCliError;
+}
+
+interface ExecFileFailure extends Error {
+  code?: string | number;
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
+  signal?: string | null;
+  killed?: boolean;
+}
+
+function toText(chunk: string | Buffer | undefined): string {
+  if (!chunk) return '';
+  return typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+}
+
+function isQuotaLikeMessage(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return QUOTA_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+function extractJsonObjects(text: string): string[] {
+  const blocks: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      isEscaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+      continue;
+    }
+
+    if (char === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        blocks.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return blocks;
+}
+
+function parseGeminiCliJson(text: string): GeminiCliJsonOutput | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const candidates = [trimmed, ...extractJsonObjects(trimmed).reverse()];
+  const visited = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (!candidate || visited.has(candidate)) continue;
+    visited.add(candidate);
+    try {
+      return JSON.parse(candidate) as GeminiCliJsonOutput;
+    } catch {
+      // continue
+    }
+  }
+
+  return null;
+}
+
+function sanitizeCliMessage(raw: string): string {
+  const firstLine = raw
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !line.startsWith('at '));
+
+  if (!firstLine) {
+    return 'gemini-cli 호출 중 오류가 발생했습니다.';
+  }
+
+  return firstLine.length > 280 ? `${firstLine.slice(0, 280)}...` : firstLine;
+}
+
+function parseGeminiCliResponse(stdout: string): string {
+  const parsed = parseGeminiCliJson(stdout);
+
+  if (parsed?.error?.message) {
+    throw new Error(parsed.error.message);
+  }
+
+  if (typeof parsed?.response === 'string' && parsed.response.trim()) {
+    return parsed.response;
+  }
+
+  const fallback = stdout.trim();
+  if (!fallback) {
+    throw new Error('No text output from gemini-cli');
+  }
+  return fallback;
+}
+
+function buildGeminiCliError(error: unknown): Error {
+  if (!(error instanceof Error)) {
+    return new Error(String(error));
+  }
+
+  const cliError = error as ExecFileFailure;
+  const stdout = toText(cliError.stdout);
+  const stderr = toText(cliError.stderr);
+  const parsedStdout = parseGeminiCliJson(stdout);
+  const parsedStderr = parseGeminiCliJson(stderr);
+
+  const cliMessage = parsedStdout?.error?.message ||
+    parsedStderr?.error?.message ||
+    parsedStdout?.response ||
+    parsedStderr?.response;
+
+  if (cliError.code === 'ENOENT') {
+    return new Error('gemini-cli 실행 파일을 찾을 수 없습니다. GEMINI_CLI_PATH 또는 PATH를 확인해주세요.');
+  }
+
+  if (cliError.killed || cliError.signal === 'SIGTERM') {
+    return new Error(`gemini-cli 실행 시간이 ${Math.round(GEMINI_CLI_TIMEOUT_MS / 1000)}초를 초과했습니다.`);
+  }
+
+  if (cliMessage && cliMessage.trim()) {
+    return new Error(sanitizeCliMessage(cliMessage));
+  }
+
+  const combinedOutput = `${stdout}\n${stderr}`;
+  if (isQuotaLikeMessage(combinedOutput)) {
+    return new Error('API quota exceeded (429)');
+  }
+
+  if (stderr.trim()) {
+    return new Error(sanitizeCliMessage(stderr));
+  }
+
+  if (stdout.trim()) {
+    return new Error(sanitizeCliMessage(stdout));
+  }
+
+  return new Error('gemini-cli 호출에 실패했습니다.');
+}
+
+async function acquireCliSlot(): Promise<void> {
+  if (activeCliRequests < GEMINI_CLI_MAX_CONCURRENCY) {
+    activeCliRequests++;
+    return;
+  }
+
+  if (cliRequestQueue.length >= GEMINI_CLI_MAX_QUEUE_DEPTH) {
+    throw new GeminiQueueFullError();
+  }
+
+  await new Promise<void>((resolve) => {
+    cliRequestQueue.push(resolve);
+  });
+
+  activeCliRequests++;
+}
+
+function releaseCliSlot(): void {
+  activeCliRequests = Math.max(0, activeCliRequests - 1);
+  const next = cliRequestQueue.shift();
+  if (next) {
+    next();
+  }
+}
+
+function buildGeminiCliArgs(prompt: string, modelName: GeminiModelName): string[] {
+  const args = ['-m', modelName, '-p', prompt, '--output-format', 'json'];
+  if (GEMINI_CLI_ALLOWED_TOOLS) {
+    args.push('--allowed-tools', GEMINI_CLI_ALLOWED_TOOLS);
+  }
+  return args;
+}
+
+async function runGeminiCliPrompt(prompt: string, modelName: GeminiModelName): Promise<string> {
+  let slotAcquired = false;
+
+  try {
+    await acquireCliSlot();
+    slotAcquired = true;
+
+    const { stdout } = await execFileAsync(
+      GEMINI_CLI_COMMAND,
+      buildGeminiCliArgs(prompt, modelName),
+      {
+        encoding: 'utf8',
+        timeout: GEMINI_CLI_TIMEOUT_MS,
+        maxBuffer: GEMINI_CLI_MAX_BUFFER_BYTES,
+      }
+    );
+
+    return parseGeminiCliResponse(toText(stdout));
+  } catch (error) {
+    if (error instanceof GeminiQueueFullError) {
+      throw error;
+    }
+    throw buildGeminiCliError(error);
+  } finally {
+    if (slotAcquired) {
+      releaseCliSlot();
+    }
+  }
+}
+
+export function getGeminiCliLoad(): { activeRequests: number; queuedRequests: number } {
+  return {
+    activeRequests: activeCliRequests,
+    queuedRequests: cliRequestQueue.length,
+  };
+}
+
+export function getGeminiCliLimits(): { maxQueueDepth: number; maxConcurrency: number } {
+  return {
+    maxQueueDepth: GEMINI_CLI_MAX_QUEUE_DEPTH,
+    maxConcurrency: GEMINI_CLI_MAX_CONCURRENCY,
+  };
 }
 
 /**
@@ -65,15 +399,24 @@ function extractTextFromOutputs(outputs: Array<{ type?: string; text?: string }>
  */
 function parseJsonFromResponse<T>(text: string): T {
   if (!text) {
-    throw new Error('No text output from Gemini API');
+    throw new Error('No text output from gemini-cli');
   }
 
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error('Invalid response format from Gemini API');
+  const candidates = [text.trim(), ...extractJsonObjects(text).reverse()];
+  const visited = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (!candidate || visited.has(candidate)) continue;
+    visited.add(candidate);
+
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // continue
+    }
   }
 
-  return JSON.parse(jsonMatch[0]) as T;
+  throw new Error('Invalid response format from gemini-cli');
 }
 
 /**
@@ -82,11 +425,7 @@ function parseJsonFromResponse<T>(text: string): T {
 function isQuotaError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
 
-  const errorMessage = error.message.toLowerCase();
-  return errorMessage.includes('quota') ||
-         errorMessage.includes('rate limit') ||
-         errorMessage.includes('429') ||
-         errorMessage.includes('resource exhausted');
+  return isQuotaLikeMessage(error.message);
 }
 
 /**
@@ -109,59 +448,137 @@ export async function generateMarketPrediction(
 ): Promise<MarketPrediction> {
   const {
     us10yYield,
+    us2yYield,
+    yieldCurveSpread,
     dxy,
     highYieldSpread,
     m2MoneySupply,
     cpi,
     payems,
+    sp500,
+    nasdaq,
+    russell2000,
     crudeOil,
+    gold,
+    moveIndex,
     copperGoldRatio,
     pmi,
     putCallRatio,
     bitcoin,
+    usdKrw,
+    kospi,
+    ewy,
+    kosdaq,
+    kr3yBond,
+    kr10yBond,
+    koreaSemiconductorExportsProxy,
+    koreaTradeBalance,
   } = dashboardData.indicators;
 
   // Generate dynamic date for search queries
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const advancedSignals = [
+    `US10Y: ${formatAdvancedSignal(us10yYield)}`,
+    `US2Y: ${formatAdvancedSignal(us2yYield)}`,
+    `T10Y2Y: ${formatAdvancedSignal(yieldCurveSpread)}`,
+    `DXY: ${formatAdvancedSignal(dxy)}`,
+    `HYS: ${formatAdvancedSignal(highYieldSpread)}`,
+    `M2: ${formatAdvancedSignal(m2MoneySupply)}`,
+    `CPI: ${formatAdvancedSignal(cpi)}`,
+    `PAYEMS: ${formatAdvancedSignal(payems)}`,
+    `SPX: ${formatAdvancedSignal(sp500)}`,
+    `IXIC: ${formatAdvancedSignal(nasdaq)}`,
+    `RUT: ${formatAdvancedSignal(russell2000)}`,
+    `OIL: ${formatAdvancedSignal(crudeOil)}`,
+    `GOLD: ${formatAdvancedSignal(gold)}`,
+    `MOVE: ${formatAdvancedSignal(moveIndex)}`,
+    `Cu/Au: ${formatAdvancedSignal(copperGoldRatio)}`,
+    `BTC: ${formatAdvancedSignal(bitcoin)}`,
+    `USDKRW: ${formatAdvancedSignal(usdKrw)}`,
+    `KOSPI: ${formatAdvancedSignal(kospi)}`,
+    `EWY: ${formatAdvancedSignal(ewy)}`,
+    `KOSDAQ: ${formatAdvancedSignal(kosdaq)}`,
+    `KR3Y: ${formatAdvancedSignal(kr3yBond)}`,
+    `KR10Y: ${formatAdvancedSignal(kr10yBond)}`,
+    `KRSEMI: ${formatAdvancedSignal(koreaSemiconductorExportsProxy)}`,
+    `KRTB: ${formatAdvancedSignal(koreaTradeBalance)}`,
+    `MFG: ${formatAdvancedSignal(pmi)}`,
+    `VIX: ${formatAdvancedSignal(putCallRatio)}`,
+  ].join('\n');
 
-  const prompt = `You are a professional financial market analyst. Provide a comprehensive market outlook by analyzing the following 11 economic indicators.
+  const prompt = `You are a professional financial market analyst. Provide a comprehensive market outlook by analyzing the following 26 economic and market indicators.
 
 === Economic Indicators ===
 
 **Macro Indicators (Daily Data - 1D/7D/30D periods):**
 1. US 10-Year Treasury Yield: ${us10yYield.value.toFixed(2)}% (${formatPeriodChanges(us10yYield)})
-2. US Dollar Index (DXY): ${dxy.value.toFixed(2)} (${formatPeriodChanges(dxy)})
-3. High Yield Spread: ${highYieldSpread.value.toFixed(2)} bps (${formatPeriodChanges(highYieldSpread)})
+2. US 2-Year Treasury Yield: ${us2yYield.value.toFixed(2)}% (${formatPeriodChanges(us2yYield)})
+3. 10Y-2Y Yield Curve Spread: ${yieldCurveSpread.value.toFixed(2)}pp (${formatPeriodChanges(yieldCurveSpread)})
+4. US Dollar Index (DXY): ${dxy.value.toFixed(2)} (${formatPeriodChanges(dxy)})
+5. High Yield Spread: ${highYieldSpread.value.toFixed(2)} bps (${formatPeriodChanges(highYieldSpread)})
 
 **Macro Indicators (Monthly Data - 1M/2M/3M periods):**
-4. M2 Money Supply: $${m2MoneySupply.value.toFixed(2)}B (${formatPeriodChanges(m2MoneySupply, true)})
-5. Consumer Price Index (CPI): ${cpi.value.toFixed(2)} (Index, Base 1982-1984=100) - (${formatPeriodChanges(cpi, true)})
+6. M2 Money Supply: $${m2MoneySupply.value.toFixed(2)}B (${formatPeriodChanges(m2MoneySupply, true)})
+7. Consumer Price Index (CPI): ${cpi.value.toFixed(2)} (Index, Base 1982-1984=100) - (${formatPeriodChanges(cpi, true)})
    → 인플레이션 추세 및 연준 통화정책 방향성의 핵심 지표
-6. Total Nonfarm Employment: ${payems.value.toFixed(2)}M persons - (1M change: ${payems.change >= 0 ? '+' : ''}${payems.change.toFixed(2)}M / ${payems.changePercent.toFixed(2)}%, 2M: ${payems.change7d && payems.change7d >= 0 ? '+' : ''}${payems.change7d?.toFixed(2)}M / ${payems.changePercent7d?.toFixed(2)}%, 3M: ${payems.change30d && payems.change30d >= 0 ? '+' : ''}${payems.change30d?.toFixed(2)}M / ${payems.changePercent30d?.toFixed(2)}%)
+8. Total Nonfarm Employment: ${payems.value.toFixed(2)}M persons - (1M change: ${payems.change >= 0 ? '+' : ''}${payems.change.toFixed(2)}M / ${payems.changePercent.toFixed(2)}%, 2M: ${payems.change7d && payems.change7d >= 0 ? '+' : ''}${payems.change7d?.toFixed(2)}M / ${payems.changePercent7d?.toFixed(2)}%, 3M: ${payems.change30d && payems.change30d >= 0 ? '+' : ''}${payems.change30d?.toFixed(2)}M / ${payems.changePercent30d?.toFixed(2)}%)
    → 전체 비농업 고용자 수. 1M change는 월간 일자리 증감 (예: +0.05M = 50,000명 증가)
    → 노동시장 건전성 및 경제 성장 모멘텀의 핵심 지표
 
-**Commodity & Asset Indicators (Daily Data - 1D/7D/30D periods):**
-7. Crude Oil (WTI): $${crudeOil.value.toFixed(2)}/barrel (${formatPeriodChanges(crudeOil)})
-8. Copper/Gold Ratio: ${copperGoldRatio.value.toFixed(2)}×10000 (${formatPeriodChanges(copperGoldRatio)})
-9. Bitcoin (BTC/USD): $${bitcoin.value.toFixed(2)} (${formatPeriodChanges(bitcoin)})
+**US Equity Market Indicators (Daily Data - 1D/7D/30D periods):**
+9. S&P 500 Index: ${sp500.value.toFixed(2)} (${formatPeriodChanges(sp500)})
+10. Nasdaq Composite: ${nasdaq.value.toFixed(2)} (${formatPeriodChanges(nasdaq)})
+11. Russell 2000 Index: ${russell2000.value.toFixed(2)} (${formatPeriodChanges(russell2000)})
 
-**Market Sentiment Indicators:**
-10. Manufacturing Confidence - OECD (Monthly Data - 1M/2M/3M periods): ${pmi.value.toFixed(2)} (${formatPeriodChanges(pmi, true)})
-11. VIX - Fear Index (Daily Data - 1D/7D/30D periods): ${putCallRatio.value.toFixed(2)} (${formatPeriodChanges(putCallRatio)})
+**Commodity & Asset Indicators (Daily Data - 1D/7D/30D periods):**
+12. Crude Oil (WTI): $${crudeOil.value.toFixed(2)}/barrel (${formatPeriodChanges(crudeOil)})
+13. Gold (COMEX): $${gold.value.toFixed(2)}/oz (${formatPeriodChanges(gold)})
+14. Copper/Gold Ratio: ${copperGoldRatio.value.toFixed(2)}×10000 (${formatPeriodChanges(copperGoldRatio)})
+15. Bitcoin (BTC/USD): $${bitcoin.value.toFixed(2)} (${formatPeriodChanges(bitcoin)})
+
+**Risk-Sensitive Indicators:**
+16. VIX - Fear Index (Daily Data - 1D/7D/30D periods): ${putCallRatio.value.toFixed(2)} (${formatPeriodChanges(putCallRatio)})
+17. MOVE Index - US Rate Volatility (Daily Data - 1D/7D/30D periods): ${moveIndex.value.toFixed(2)} (${formatPeriodChanges(moveIndex)})
+
+**Korea-Related Indicators (Daily Data - 1D/7D/30D periods):**
+18. USD/KRW Exchange Rate: ${usdKrw.value.toFixed(2)} KRW/USD (${formatPeriodChanges(usdKrw)})
+19. KOSPI Composite: ${kospi.value.toFixed(2)} (${formatPeriodChanges(kospi)})
+20. iShares MSCI Korea ETF (EWY): ${ewy.value.toFixed(2)} (${formatPeriodChanges(ewy)})
+
+**Korea-Specialized Indicators:**
+21. KOSDAQ Composite: ${kosdaq.value.toFixed(2)} (${formatPeriodChanges(kosdaq)})
+22. KR 3Y Treasury Proxy (KTB ETF): ${kr3yBond.value.toFixed(2)} KRW (${formatPeriodChanges(kr3yBond)})
+23. KR 10Y Treasury Proxy (KTB ETF): ${kr10yBond.value.toFixed(2)} KRW (${formatPeriodChanges(kr10yBond)})
+24. Korea Semiconductor Exports Proxy (KODEX Semiconductor ETF): ${koreaSemiconductorExportsProxy.value.toFixed(2)} KRW (${formatPeriodChanges(koreaSemiconductorExportsProxy)})
+25. Korea Trade Balance (Commodities, Monthly): ${koreaTradeBalance.value.toFixed(2)} Trillion KRW (${formatPeriodChanges(koreaTradeBalance, true)})
+
+**Manufacturing Sentiment (Monthly Data - 1M/2M/3M periods):**
+26. Manufacturing Confidence - OECD: ${pmi.value.toFixed(2)} (${formatPeriodChanges(pmi, true)})
+
+=== Advanced Quantitative Signals (IMPORTANT SUPPORTING DATA) ===
+Use the additional signals below to increase accuracy, especially for momentum reversals and volatility regimes:
+${advancedSignals}
+
+Interpretation requirements for this section:
+- Explicitly check if trend is consistent_uptrend / consistent_downtrend / mixed_trend
+- Use volatility to assess confidence level (high volatility = lower confidence, higher risk)
+- Use recent_series to verify whether latest movement is acceleration or mean reversion
 
 === Analysis Priority (CRITICAL) ===
 
 Your analysis MUST follow this strict priority order:
 
 **1. PRIMARY (50% weight): Economic Indicators**
-   - Base your core analysis on the 11 indicators' multi-period trends (1D/7D/30D or 1M/2M/3M)
+   - Base your core analysis on the 26 indicators' multi-period trends (1D/7D/30D or 1M/2M/3M)
    - Indicator movements are the foundation of your market outlook
    - Compare timeframes to identify momentum, trend reversals, and structural changes
    - **CPI와 NFP는 연준 정책 결정의 핵심 변수이므로 특별히 주목**:
      * CPI: 인플레이션 목표(2%) 대비 현황 평가
      * NFP: 고용시장 과열/냉각 여부 판단
+   - **T10Y2Y, VIX, MOVE는 경기 둔화/금융 스트레스 조기 신호로 별도 점검**
+   - **USDKRW, KOSPI, KOSDAQ, EWY, KR3Y/KR10Y, KRSEMI, KRTB를 통해 한국/아시아 리스크 전이 여부를 함께 평가**
+   - KR3Y/KR10Y/KRSEMI are market-traded proxies, so interpret with caution and focus on direction/momentum
    - 지표 간 상관관계 고려 (예: CPI↑ + NFP강세 → 긴축 압력 증가)
 
 **2. SECONDARY (25% weight): Official Announcements**
@@ -263,8 +680,8 @@ Categorize each opinion as BULLISH, BEARISH, or NEUTRAL:
 
 === Analysis Requirements ===
 1. **Multi-Period Indicator Analysis** (PRIMARY - 50%):
-   - For DAILY indicators (#1-3, #7-9, #11): Use 1D/7D/30D periods to identify short-term vs long-term trends
-   - For MONTHLY indicators (#4-6, #10): Use 1M/2M/3M periods to identify monthly trends
+   - For DAILY indicators (US10Y, US2Y, T10Y2Y, DXY, HYS, SPX, IXIC, RUT, OIL, GOLD, Cu/Au, BTC, VIX, MOVE, USDKRW, KOSPI, EWY, KOSDAQ, KR3Y, KR10Y, KRSEMI): Use 1D/7D/30D periods to identify short-term vs long-term trends
+   - For MONTHLY indicators (M2, CPI, PAYEMS, KRTB, MFG): Use 1M/2M/3M periods to identify monthly trends
    - Compare different timeframes to assess momentum and trend reversals
    - Analyze cross-indicator relationships (e.g., yields vs dollar, VIX vs equities)
 
@@ -308,14 +725,7 @@ CRITICAL:
 - When citing sources, mention the actual institution/analyst name (e.g., "Goldman Sachs", "Morgan Stanley"), NOT generic terms`;
 
   try {
-    const interaction = await genAI.interactions.create({
-      model: modelName,
-      input: prompt,
-      tools: [{ type: 'google_search' }],
-      response_modalities: ['text'],
-    });
-
-    const text = extractTextFromOutputs(interaction.outputs);
+    const text = await runGeminiCliPrompt(prompt, modelName);
     const prediction = parseJsonFromResponse<{ sentiment: string; reasoning: string; risks?: string[] }>(text);
 
     return {
@@ -343,7 +753,8 @@ CRITICAL:
  * 2. Expected impact of this change
  */
 export async function generateBatchComments(
-  indicators: Array<{ symbol: string; data: IndicatorData }>
+  indicators: Array<{ symbol: string; data: IndicatorData }>,
+  modelName: GeminiModelName = DEFAULT_GEMINI_MODEL
 ): Promise<Record<string, string>> {
   // Generate current date string for context
   const today = new Date();
@@ -355,7 +766,7 @@ export async function generateBatchComments(
 
   // Build indicator descriptions for prompt
   const indicatorDescriptions = indicators.map(({ symbol, data }) => {
-    const isMonthly = symbol === 'MFG' || symbol === 'M2' || symbol === 'CPI' || symbol === 'PAYEMS';
+    const isMonthly = symbol === 'MFG' || symbol === 'M2' || symbol === 'CPI' || symbol === 'PAYEMS' || symbol === 'KRTB';
     const periodContext = formatPeriodChanges(data, isMonthly);
     return `${symbol} (${data.name}): ${data.value.toFixed(2)}${data.unit || ''} [${periodContext}]`;
   }).join('\n');
@@ -421,14 +832,7 @@ Explain what this change means for specific markets, sectors, or assets.
 Generate comments for these symbols: ${symbolList}`;
 
   try {
-    const response = await genAI.interactions.create({
-      model: 'gemini-2.5-flash-lite',
-      input: prompt,
-      tools: [{ type: 'google_search' }],
-      response_modalities: ['text'],
-    });
-
-    const text = extractTextFromOutputs(response.outputs);
+    const text = await runGeminiCliPrompt(prompt, modelName);
     const comments = parseJsonFromResponse<Record<string, string>>(text);
 
     // Validate that all requested symbols have comments

@@ -37,6 +37,8 @@ export interface DashboardData {
   indicators: {
     // Core indicators
     us10yYield: IndicatorData;
+    us2yYield: IndicatorData;
+    yieldCurveSpread: IndicatorData;
     dxy: IndicatorData;
     highYieldSpread: IndicatorData;
 
@@ -52,9 +54,30 @@ export interface DashboardData {
     // Digital asset indicator (Phase 8)
     bitcoin: IndicatorData;
 
+    // Equity market indicators (Phase 12)
+    sp500: IndicatorData;
+    nasdaq: IndicatorData;
+    russell2000: IndicatorData;
+    gold: IndicatorData;
+
     // Inflation & Employment indicators (Phase 11)
     cpi: IndicatorData;     // Consumer Price Index
     payems: IndicatorData;  // Total Nonfarm Employment (PAYEMS)
+
+    // Risk-sensitive indicators (Phase 13)
+    moveIndex: IndicatorData;
+
+    // Korea-related indicators (Phase 13)
+    usdKrw: IndicatorData;
+    kospi: IndicatorData;
+    ewy: IndicatorData;
+
+    // Korea-specialized indicators (Phase 14)
+    kosdaq: IndicatorData;
+    kr3yBond: IndicatorData;
+    kr10yBond: IndicatorData;
+    koreaSemiconductorExportsProxy: IndicatorData;
+    koreaTradeBalance: IndicatorData;
   };
   timestamp: string;
 }
