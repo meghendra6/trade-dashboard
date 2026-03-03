@@ -1222,7 +1222,7 @@ export async function generateAIComments(indicators: {
   kr10yBond: IndicatorData;
   koreaSemiconductorExportsProxy: IndicatorData;
   koreaTradeBalance: IndicatorData;
-}): Promise<Record<string, string | undefined>> {
+}, options: { forceRefresh?: boolean } = {}): Promise<Record<string, string | undefined>> {
   function formatSignedPercent(value: number | undefined): string {
     if (value === undefined || Number.isNaN(value)) {
       return 'n/a';
@@ -1301,26 +1301,32 @@ export async function generateAIComments(indicators: {
 
   console.log(`[generateAIComments] Starting batch AI comment generation for ${indicatorMap.length} indicators`);
   const startTime = Date.now();
-
-  // Step 1: Check cache for all indicators (parallel - fast)
-  const cacheResults = await Promise.all(
-    indicatorMap.map(async ({ symbol, data }) => {
-      const cached = await indicatorCommentCache.getComment(symbol, data);
-      return { symbol, data, cached };
-    })
-  );
+  const forceRefresh = options.forceRefresh === true;
 
   // Separate cache hits and misses
   const cacheHits: Array<{ symbol: string; data: IndicatorData }> = [];
   const cacheMisses: Array<{ symbol: string; data: IndicatorData }> = [];
 
-  for (const { symbol, data, cached } of cacheResults) {
-    if (cached) {
-      comments[symbol] = cached;
-      cacheHits.push({ symbol, data });
-      console.log(`[generateAIComments] Cache hit: ${symbol}`);
-    } else {
-      cacheMisses.push({ symbol, data });
+  if (forceRefresh) {
+    cacheMisses.push(...indicatorMap);
+    console.log(`[generateAIComments] Force refresh enabled: bypassing cache for ${indicatorMap.length} indicators`);
+  } else {
+    // Step 1: Check cache for all indicators (parallel - fast)
+    const cacheResults = await Promise.all(
+      indicatorMap.map(async ({ symbol, data }) => {
+        const cached = await indicatorCommentCache.getComment(symbol, data);
+        return { symbol, data, cached };
+      })
+    );
+
+    for (const { symbol, data, cached } of cacheResults) {
+      if (cached) {
+        comments[symbol] = cached;
+        cacheHits.push({ symbol, data });
+        console.log(`[generateAIComments] Cache hit: ${symbol}`);
+      } else {
+        cacheMisses.push({ symbol, data });
+      }
     }
   }
 

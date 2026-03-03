@@ -116,7 +116,10 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    const { indicators } = body as { indicators: DashboardData['indicators'] };
+    const { indicators, forceRefresh } = body as {
+      indicators: DashboardData['indicators'];
+      forceRefresh?: boolean;
+    };
 
     const sanitizedIndicators = sanitizeIndicators(indicators);
     if (!sanitizedIndicators) {
@@ -129,7 +132,9 @@ export async function POST(request: Request) {
     console.log('[API indicator-comments] Generating batch AI comments...');
 
     // Generate AI comments and get comments record directly
-    const comments = await generateAIComments(sanitizedIndicators);
+    const comments = await generateAIComments(sanitizedIndicators, {
+      forceRefresh: forceRefresh === true,
+    });
 
     console.log('[API indicator-comments] Completed');
 

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   DashboardData,
   IndicatorData,
@@ -29,6 +29,8 @@ import {
 
 interface AdvancedAnalyticsProps {
   dashboardData: DashboardData;
+  autoRefreshTick: number;
+  manualRefreshTick: number;
 }
 
 interface IndicatorEntry {
@@ -37,6 +39,7 @@ interface IndicatorEntry {
 }
 
 const MONTHLY_SYMBOLS = new Set(['MFG', 'M2', 'CPI', 'PAYEMS', 'KRTB']);
+const ADVANCED_EXPLANATION_STORAGE_KEY = 'trade-dashboard-advanced-explanation-cache-v1';
 
 function toFixedOrDash(value: number | null | undefined, digits = 2): string {
   if (value === null || value === undefined || Number.isNaN(value)) return '-';
@@ -207,58 +210,86 @@ function ExpandedIndicatorChart({ entry }: { entry: IndicatorEntry }) {
   );
 }
 
-export default function AdvancedAnalytics({ dashboardData }: AdvancedAnalyticsProps) {
+export default function AdvancedAnalytics({
+  dashboardData,
+  autoRefreshTick,
+  manualRefreshTick,
+}: AdvancedAnalyticsProps) {
   const [explanation, setExplanation] = useState<AdvancedAnalyticsExplanation | null>(null);
   const [explanationLoading, setExplanationLoading] = useState(false);
   const [explanationError, setExplanationError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    if (typeof window === 'undefined') return;
 
-    const fetchExplanation = async () => {
-      try {
-        setExplanationLoading(true);
-        setExplanationError(null);
-
-        const response = await fetch('/api/advanced-analytics-explanations', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            dashboardData,
-            modelName: DEFAULT_GEMINI_MODEL,
-          }),
-        });
-
-        if (!response.ok) {
-          const message = await parseApiErrorMessage(response, advancedAnalyticsErrorFallback);
-          throw new Error(message);
-        }
-
-        const data = (await response.json()) as AdvancedAnalyticsExplanation;
-        if (!cancelled) {
-          setExplanation(data);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setExplanationError(
-            error instanceof Error ? error.message : '고급 분석을 생성하는 중 오류가 발생했습니다.'
-          );
-        }
-      } finally {
-        if (!cancelled) {
-          setExplanationLoading(false);
-        }
+    try {
+      const raw = localStorage.getItem(ADVANCED_EXPLANATION_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { explanation?: AdvancedAnalyticsExplanation } | null;
+      if (parsed?.explanation) {
+        setExplanation(parsed.explanation);
       }
-    };
+    } catch (error) {
+      console.warn('Failed to load cached advanced analytics explanation:', error);
+    }
+  }, []);
 
-    fetchExplanation();
+  const fetchExplanation = useCallback(async (forceRefresh: boolean) => {
+    try {
+      setExplanationLoading(true);
+      setExplanationError(null);
 
-    return () => {
-      cancelled = true;
-    };
+      const response = await fetch('/api/advanced-analytics-explanations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          dashboardData,
+          modelName: DEFAULT_GEMINI_MODEL,
+          forceRefresh,
+        }),
+      });
+
+      if (!response.ok) {
+        const message = await parseApiErrorMessage(response, advancedAnalyticsErrorFallback);
+        throw new Error(message);
+      }
+
+      const data = (await response.json()) as AdvancedAnalyticsExplanation;
+      setExplanation(data);
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(
+          ADVANCED_EXPLANATION_STORAGE_KEY,
+          JSON.stringify({
+            explanation: data,
+            updatedAt: new Date().toISOString(),
+          })
+        );
+      }
+    } catch (error) {
+      setExplanationError(
+        error instanceof Error ? error.message : '고급 분석을 생성하는 중 오류가 발생했습니다.'
+      );
+    } finally {
+      setExplanationLoading(false);
+    }
   }, [dashboardData]);
+
+  useEffect(() => {
+    if (autoRefreshTick === 0) {
+      return;
+    }
+    fetchExplanation(false);
+  }, [autoRefreshTick, fetchExplanation]);
+
+  useEffect(() => {
+    if (manualRefreshTick === 0) {
+      return;
+    }
+    fetchExplanation(true);
+  }, [manualRefreshTick, fetchExplanation]);
 
   const entries: IndicatorEntry[] = Object.entries(dashboardData.indicators).map(([key, indicator]) => ({
     key,
@@ -298,12 +329,20 @@ export default function AdvancedAnalytics({ dashboardData }: AdvancedAnalyticsPr
           </h3>
         </div>
 
-        {explanationLoading ? (
+        {explanationLoading && !explanation ? (
           <p className="text-sm text-zinc-500 dark:text-zinc-400">AI가 고급 차트 의미를 분석 중입니다...</p>
-        ) : explanationError ? (
+        ) : explanationError && !explanation ? (
           <p className="text-sm text-red-600 dark:text-red-400">{explanationError}</p>
         ) : explanation ? (
           <div className="space-y-3">
+            {explanationLoading ? (
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">고급 AI 해설 갱신 중...</p>
+            ) : null}
+            {explanationError ? (
+              <p className="text-xs text-yellow-700 dark:text-yellow-300 bg-yellow-50/80 dark:bg-yellow-900/20 border border-yellow-200/60 dark:border-yellow-800/60 rounded-lg px-3 py-2">
+                {explanationError}
+              </p>
+            ) : null}
             {explanation.isFallback && explanation.fallbackMessage ? (
               <p className="text-xs text-yellow-700 dark:text-yellow-300 bg-yellow-50/80 dark:bg-yellow-900/20 border border-yellow-200/60 dark:border-yellow-800/60 rounded-lg px-3 py-2">
                 {explanation.fallbackMessage}
@@ -342,7 +381,11 @@ export default function AdvancedAnalytics({ dashboardData }: AdvancedAnalyticsPr
               {new Date(explanation.generatedAt).toLocaleString()}
             </p>
           </div>
-        ) : null}
+        ) : (
+          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+            자동 갱신 주기 또는 상단의 AI 수동 갱신 버튼으로 해설이 업데이트됩니다.
+          </p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">

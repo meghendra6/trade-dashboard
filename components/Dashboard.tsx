@@ -7,21 +7,33 @@ import AIPrediction from './AIPrediction';
 import AdvancedAnalytics from './AdvancedAnalytics';
 import { INDICATOR_GROUPS } from '@/lib/constants/indicator-groups';
 
+const AI_COMMENTS_STORAGE_KEY = 'trade-dashboard-ai-comments-cache-v1';
+const AI_AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const AI_AUTO_REFRESH_INTERVAL_MINUTES = Math.round(AI_AUTO_REFRESH_INTERVAL_MS / 60000);
+
 export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isLoadingComments, setIsLoadingComments] = useState(false);
   const [aiComments, setAiComments] = useState<IndicatorComments>({});
+  const [aiAutoRefreshTick, setAiAutoRefreshTick] = useState(0);
+  const [aiManualRefreshTick, setAiManualRefreshTick] = useState(0);
 
-  const fetchComments = useCallback(async (indicators: DashboardData['indicators']) => {
+  const fetchComments = useCallback(async (
+    indicators: DashboardData['indicators'],
+    options: { forceRefresh?: boolean } = {}
+  ) => {
     try {
       setIsLoadingComments(true);
 
       const commentsRes = await fetch('/api/indicator-comments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ indicators }),
+        body: JSON.stringify({
+          indicators,
+          forceRefresh: options.forceRefresh === true,
+        }),
       });
 
       if (!commentsRes.ok) {
@@ -33,7 +45,21 @@ export default function Dashboard() {
       const comments: IndicatorComments = data?.comments ?? {};
 
       // Update aiComments state separately (does not affect dashboardData reference)
-      setAiComments((prev) => ({ ...prev, ...comments }));
+      setAiComments((prev) => {
+        const merged = { ...prev, ...comments };
+
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(
+            AI_COMMENTS_STORAGE_KEY,
+            JSON.stringify({
+              comments: merged,
+              updatedAt: new Date().toISOString(),
+            })
+          );
+        }
+
+        return merged;
+      });
     } catch (err) {
       console.error('Error fetching AI comments:', err);
     } finally {
@@ -55,19 +81,56 @@ export default function Dashboard() {
       const dashboardData: DashboardData = await indicatorsRes.json();
       setData(dashboardData);
 
-      // Fetch AI comments in background after indicators are loaded
-      fetchComments(dashboardData.indicators);
-
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
     }
-  }, [fetchComments]);
+  }, []);
 
   useEffect(() => {
     fetchIndicators();
   }, [fetchIndicators]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(AI_COMMENTS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { comments?: IndicatorComments } | null;
+      if (parsed?.comments && typeof parsed.comments === 'object') {
+        setAiComments(parsed.comments);
+      }
+    } catch (error) {
+      console.warn('Failed to load cached AI comments:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setAiAutoRefreshTick((prev) => prev + 1);
+    }, AI_AUTO_REFRESH_INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!data || aiAutoRefreshTick === 0) {
+      return;
+    }
+    fetchComments(data.indicators, { forceRefresh: false });
+  }, [aiAutoRefreshTick, data, fetchComments]);
+
+  useEffect(() => {
+    if (!data || aiManualRefreshTick === 0) {
+      return;
+    }
+    fetchComments(data.indicators, { forceRefresh: true });
+  }, [aiManualRefreshTick, data, fetchComments]);
+
+  const triggerManualAiRefresh = useCallback(() => {
+    setAiManualRefreshTick((prev) => prev + 1);
+  }, []);
 
   // Generate filename with timestamp: trade-dashboard-YYYY-MM-DD-HH-MM.json
   const generateFileName = (): string => {
@@ -168,16 +231,28 @@ export default function Dashboard() {
           <p className="text-sm text-zinc-500 dark:text-zinc-400">
             Market indicators updated at {new Date(data.timestamp).toLocaleString()}
           </p>
-          <button
-            onClick={downloadJSON}
-            className="px-4 py-2 bg-zinc-900 dark:bg-zinc-50 text-white dark:text-zinc-900 rounded-xl hover:bg-zinc-700 dark:hover:bg-zinc-200 transition-all hover:scale-105 hover:shadow-lg backdrop-blur-sm flex items-center gap-2 text-sm font-medium"
-            title="Download all indicator data as JSON file"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-            </svg>
-            <span>Export Indicators JSON</span>
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              AI auto refresh: every {AI_AUTO_REFRESH_INTERVAL_MINUTES} min
+            </span>
+            <button
+              onClick={triggerManualAiRefresh}
+              className="px-4 py-2 bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 rounded-xl hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-all hover:scale-105 hover:shadow-lg backdrop-blur-sm flex items-center gap-2 text-sm font-medium"
+              title="Refresh all AI analysis now"
+            >
+              <span>Refresh AI Now</span>
+            </button>
+            <button
+              onClick={downloadJSON}
+              className="px-4 py-2 bg-zinc-900 dark:bg-zinc-50 text-white dark:text-zinc-900 rounded-xl hover:bg-zinc-700 dark:hover:bg-zinc-200 transition-all hover:scale-105 hover:shadow-lg backdrop-blur-sm flex items-center gap-2 text-sm font-medium"
+              title="Download all indicator data as JSON file"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              <span>Export Indicators JSON</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -207,9 +282,17 @@ export default function Dashboard() {
         ))}
       </div>
 
-      <AdvancedAnalytics dashboardData={data} />
+      <AdvancedAnalytics
+        dashboardData={data}
+        autoRefreshTick={aiAutoRefreshTick}
+        manualRefreshTick={aiManualRefreshTick}
+      />
 
-      <AIPrediction dashboardData={data} />
+      <AIPrediction
+        dashboardData={data}
+        autoRefreshTick={aiAutoRefreshTick}
+        manualRefreshTick={aiManualRefreshTick}
+      />
 
       {loading && (
         <div className="mt-4 text-center">
