@@ -12,10 +12,20 @@ import { parseApiErrorMessage } from '@/lib/utils/api-error-message';
 
 const STORAGE_KEY = 'gemini-model-preference';
 const STORAGE_MIGRATION_KEY = 'gemini-model-preference-default-model-migrated';
+const PREDICTION_CACHE_KEY = 'trade-dashboard-ai-prediction-cache-v1';
 
 interface AIPredictionProps {
   dashboardData: DashboardData;
+  autoRefreshTick: number;
+  manualRefreshTick: number;
 }
+
+interface CachedPredictionEntry {
+  prediction: MarketPrediction;
+  cachedAt: string;
+}
+
+type CachedPredictionMap = Partial<Record<GeminiModelName, CachedPredictionEntry>>;
 
 function statusFallbackMessage(status: number): string {
   if (status === 429) return 'API 사용 한도가 초과되었습니다. 잠시 후 다시 시도해주세요.';
@@ -24,13 +34,34 @@ function statusFallbackMessage(status: number): string {
   return '요청 처리 중 오류가 발생했습니다.';
 }
 
-export default function AIPrediction({ dashboardData }: AIPredictionProps) {
+function readPredictionCache(): CachedPredictionMap {
+  if (typeof window === 'undefined') return {};
+
+  try {
+    const raw = localStorage.getItem(PREDICTION_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as CachedPredictionMap;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePredictionCache(cache: CachedPredictionMap): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(PREDICTION_CACHE_KEY, JSON.stringify(cache));
+}
+
+export default function AIPrediction({
+  dashboardData,
+  autoRefreshTick,
+  manualRefreshTick,
+}: AIPredictionProps) {
   const [prediction, setPrediction] = useState<MarketPrediction | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dots, setDots] = useState(1);
   const [selectedModel, setSelectedModel] = useState<GeminiModelName>(() => {
-    // Load initial model from localStorage (runs only once)
     if (typeof window === 'undefined') {
       return DEFAULT_GEMINI_MODEL;
     }
@@ -38,46 +69,36 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
     try {
       const savedModel = localStorage.getItem(STORAGE_KEY) as GeminiModelName | null;
       const hasMigrated = localStorage.getItem(STORAGE_MIGRATION_KEY) === 'true';
-      const hasValidSavedModel = Boolean(savedModel && GEMINI_MODELS.some(m => m.value === savedModel));
+      const hasValidSavedModel = Boolean(savedModel && GEMINI_MODELS.some((m) => m.value === savedModel));
 
-      // One-time migration for users who still have the old default(Pro) or no valid saved model.
       if (!hasMigrated) {
         localStorage.setItem(STORAGE_MIGRATION_KEY, 'true');
 
         if (savedModel === 'gemini-3.1-pro-preview') {
           localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
-          console.log(
-            `[AIPrediction] Migrated legacy default model from ${savedModel} to ${DEFAULT_GEMINI_MODEL}`
-          );
           return DEFAULT_GEMINI_MODEL;
         }
       }
 
       if (hasValidSavedModel) {
-        console.log(`[AIPrediction] Loaded model from localStorage: ${savedModel}`);
         return savedModel as GeminiModelName;
       }
 
       localStorage.setItem(STORAGE_KEY, DEFAULT_GEMINI_MODEL);
-      console.log(`[AIPrediction] Initialized model preference to default: ${DEFAULT_GEMINI_MODEL}`);
       return DEFAULT_GEMINI_MODEL;
-    } catch (error) {
-      console.warn('localStorage not available:', error);
+    } catch {
+      return DEFAULT_GEMINI_MODEL;
     }
-
-    console.log(`[AIPrediction] Using default model: ${DEFAULT_GEMINI_MODEL}`);
-    return DEFAULT_GEMINI_MODEL;
   });
-  const isInitialMount = useRef(true);
 
-  const fetchPrediction = useCallback(async (modelOverride?: GeminiModelName) => {
+  const hasMountedModelEffect = useRef(false);
+
+  const fetchPrediction = useCallback(async (modelOverride?: GeminiModelName, forceRefresh = false) => {
     const modelToUse = modelOverride || selectedModel;
 
     try {
       setLoading(true);
       setError(null);
-
-      console.log(`[AIPrediction] Fetching with model: ${modelToUse}`);
 
       const response = await fetch('/api/ai-prediction', {
         method: 'POST',
@@ -87,6 +108,7 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
         body: JSON.stringify({
           dashboardData,
           modelName: modelToUse,
+          forceRefresh,
         }),
       });
 
@@ -97,6 +119,13 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
 
       const data: MarketPrediction = await response.json();
       setPrediction(data);
+
+      const cache = readPredictionCache();
+      cache[modelToUse] = {
+        prediction: data,
+        cachedAt: new Date().toISOString(),
+      };
+      writePredictionCache(cache);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
@@ -104,36 +133,46 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
     }
   }, [dashboardData, selectedModel]);
 
-  // Fetch prediction when model changes (including initial mount)
   useEffect(() => {
-    // Save model to localStorage (skip on initial mount)
-    if (!isInitialMount.current) {
-      try {
-        if (typeof window !== 'undefined') {
-          localStorage.setItem(STORAGE_KEY, selectedModel);
-          console.log(`[AIPrediction] Saved model to localStorage: ${selectedModel}`);
-        }
-      } catch (error) {
-        console.warn('localStorage not available:', error);
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY, selectedModel);
       }
-    } else {
-      isInitialMount.current = false;
+    } catch {
+      // ignore localStorage errors
     }
 
-    // Fetch prediction (always, including initial mount)
-    console.log(`[AIPrediction] Fetching prediction with model: ${selectedModel}`);
-    fetchPrediction();
+    const cache = readPredictionCache();
+    const cachedEntry = cache[selectedModel];
+    if (cachedEntry?.prediction) {
+      setPrediction(cachedEntry.prediction);
+    }
+
+    if (hasMountedModelEffect.current) {
+      fetchPrediction(selectedModel, true);
+    } else {
+      hasMountedModelEffect.current = true;
+    }
   }, [selectedModel, fetchPrediction]);
 
-  // 점(...) 애니메이션 효과
   useEffect(() => {
-    if (loading) {
-      const interval = setInterval(() => {
-        setDots(prev => (prev % 3) + 1); // 1 -> 2 -> 3 -> 1
-      }, 500);
+    if (autoRefreshTick === 0) return;
+    fetchPrediction(undefined, false);
+  }, [autoRefreshTick, fetchPrediction]);
 
-      return () => clearInterval(interval);
-    }
+  useEffect(() => {
+    if (manualRefreshTick === 0) return;
+    fetchPrediction(undefined, true);
+  }, [manualRefreshTick, fetchPrediction]);
+
+  useEffect(() => {
+    if (!loading) return;
+
+    const interval = setInterval(() => {
+      setDots((prev) => (prev % 3) + 1);
+    }, 500);
+
+    return () => clearInterval(interval);
   }, [loading]);
 
   const getSentimentColor = (sentiment: string) => {
@@ -179,7 +218,6 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Model Selector */}
           <select
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value as GeminiModelName)}
@@ -193,9 +231,8 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
             ))}
           </select>
 
-          {/* Refresh Button */}
           <button
-            onClick={() => fetchPrediction()}
+            onClick={() => fetchPrediction(undefined, true)}
             disabled={loading}
             className="px-3 py-1.5 text-xs bg-zinc-100/80 dark:bg-zinc-800/80 text-zinc-700 dark:text-zinc-300 rounded-lg hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-all hover:scale-105 backdrop-blur-sm disabled:opacity-50"
           >
@@ -204,10 +241,9 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
         </div>
       </div>
 
-      {loading ? (
+      {loading && !prediction ? (
         <div className="flex items-center justify-center py-8">
           <div className="flex flex-col items-center gap-4">
-            {/* 꿈틀거리는 검은 원 */}
             <div
               className="w-14 h-14 bg-zinc-900 dark:bg-zinc-50 rounded-full"
               style={{ animation: 'wiggle 2s ease-in-out infinite' }}
@@ -218,21 +254,43 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
             </p>
           </div>
         </div>
-      ) : error || !prediction ? (
+      ) : error && !prediction ? (
         <div className="text-center py-4">
           <div className="text-red-500 text-3xl mb-2">⚠️</div>
           <p className="text-sm text-zinc-500 dark:text-zinc-300 mb-4">
-            {error || 'Failed to generate prediction'}
+            {error}
           </p>
           <button
-            onClick={() => fetchPrediction()}
+            onClick={() => fetchPrediction(undefined, true)}
             className="px-4 py-2 bg-zinc-900 dark:bg-zinc-50 text-white dark:text-zinc-900 rounded-xl hover:bg-zinc-700 dark:hover:bg-zinc-200 transition-all hover:scale-105 backdrop-blur-sm text-sm"
           >
             Retry
           </button>
         </div>
+      ) : !prediction ? (
+        <div className="text-center py-6">
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-3">
+            AI 분석은 자동 갱신 주기 또는 수동 갱신 버튼으로 업데이트됩니다.
+          </p>
+          <button
+            onClick={() => fetchPrediction(undefined, true)}
+            className="px-4 py-2 bg-zinc-900 dark:bg-zinc-50 text-white dark:text-zinc-900 rounded-xl hover:bg-zinc-700 dark:hover:bg-zinc-200 transition-all hover:scale-105 backdrop-blur-sm text-sm"
+          >
+            Refresh Now
+          </button>
+        </div>
       ) : (
         <div className="space-y-4">
+          {loading && (
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">Refreshing AI analysis...</p>
+          )}
+
+          {error && (
+            <p className="text-xs text-yellow-700 dark:text-yellow-300 bg-yellow-50/80 dark:bg-yellow-900/20 border border-yellow-200/60 dark:border-yellow-800/60 rounded-lg px-3 py-2">
+              {error}
+            </p>
+          )}
+
           {prediction.isFallback && (
             <div className="p-3 bg-yellow-50/80 dark:bg-yellow-900/30 border border-yellow-200/50 dark:border-yellow-800/50 rounded-lg backdrop-blur-sm">
               <div className="flex items-start gap-2">
@@ -305,7 +363,7 @@ export default function AIPrediction({ dashboardData }: AIPredictionProps) {
 
           <div className="pt-2 border-t border-zinc-100 dark:border-zinc-800">
             <p className="text-xs text-zinc-400 dark:text-zinc-400">
-              Model: {GEMINI_MODELS.find(m => m.value === selectedModel)?.label} |{' '}
+              Model: {GEMINI_MODELS.find((m) => m.value === selectedModel)?.label} |{' '}
               Generated: {new Date(prediction.timestamp).toLocaleString()}
               {prediction.isFallback && (
                 <span className="ml-1 text-yellow-600 dark:text-yellow-400">(과거 분석)</span>

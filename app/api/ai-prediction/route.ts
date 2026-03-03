@@ -148,6 +148,7 @@ export async function POST(request: Request) {
   // Get dashboard data and model from request body (sent by client)
   let dashboardData: DashboardData;
   let modelName: GeminiModelName = DEFAULT_GEMINI_MODEL;
+  let forceRefresh = false;
 
   try {
     const rawBody = await readRequestBodyWithLimit(request, MAX_REQUEST_BYTES);
@@ -156,7 +157,11 @@ export async function POST(request: Request) {
     }
 
     const parsedBody = JSON.parse(rawBody) as unknown;
-    const body = parsedBody as { dashboardData?: DashboardData; modelName?: GeminiModelName };
+    const body = parsedBody as {
+      dashboardData?: DashboardData;
+      modelName?: GeminiModelName;
+      forceRefresh?: boolean;
+    };
     const dashboardDataInput = body.dashboardData || parsedBody;
     const sanitizedDashboardData = sanitizeDashboardData(dashboardDataInput);
     if (!sanitizedDashboardData) {
@@ -168,6 +173,7 @@ export async function POST(request: Request) {
 
     dashboardData = sanitizedDashboardData;
     modelName = body.modelName || DEFAULT_GEMINI_MODEL;
+    forceRefresh = body.forceRefresh === true;
 
     // Validate model name
     if (!VALID_MODEL_NAMES.includes(modelName)) {
@@ -198,11 +204,13 @@ export async function POST(request: Request) {
   }
 
   try {
-    // Check cache first
-    const cachedPrediction = await geminiCache.getPrediction(dashboardData, modelName);
-    if (cachedPrediction) {
-      console.log(`[API] Returning cached Gemini prediction (model: ${modelName})`);
-      return NextResponse.json(cachedPrediction);
+    // Check cache first unless caller explicitly requests refresh
+    if (!forceRefresh) {
+      const cachedPrediction = await geminiCache.getPrediction(dashboardData, modelName);
+      if (cachedPrediction) {
+        console.log(`[API] Returning cached Gemini prediction (model: ${modelName})`);
+        return NextResponse.json(cachedPrediction);
+      }
     }
 
     const { queuedRequests } = getGeminiCliLoad();
@@ -213,8 +221,10 @@ export async function POST(request: Request) {
       return NextResponse.json(busyFallback);
     }
 
-    // Cache miss - generate new prediction
-    console.log(`[API] Cache miss - generating new Gemini prediction (model: ${modelName})`);
+    // Generate new prediction (cache miss or force refresh)
+    console.log(
+      `[API] ${forceRefresh ? 'Force refresh' : 'Cache miss'} - generating new Gemini prediction (model: ${modelName})`
+    );
     const prediction = await generateMarketPrediction(dashboardData, modelName);
 
     // Store in cache
